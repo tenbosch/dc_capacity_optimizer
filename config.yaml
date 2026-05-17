@@ -24,14 +24,63 @@ synthetic_data:
     n_skus: 100
     id_prefix: "SKU-"
     id_padding: 4                       # → SKU-0001 … SKU-0100
-    categories: [Electronics, Apparel, Food, Home]
-    unit_cube_ft3:                  {min: 0.2,  max: 2.0}
-    unit_weight_lbs:                {min: 0.5,  max: 15.0}
     units_per_case_choices:         [6, 12, 24, 36]
     cases_per_pallet_choices:       [20, 30, 40, 50]
-    revenue_per_unit:               {min: 8.0,  max: 50.0}
-    cogs_per_unit:                  {min: 3.0,  max: 25.0}
-    holding_cost_per_unit_per_day:  {min: 0.01, max: 0.20}
+
+    # Pharma-distribution product mix. Each SKU picks a category uniformly,
+    # then draws its dimensional and economic params from that category's
+    # ranges. Ranges are tuned so the cross-category average roughly matches
+    # the prior global ranges, keeping storage/throughput utilization stable.
+    categories:
+      - name: "brand-name pharmaceuticals"
+        unit_cube_ft3:                 {min: 0.1, max: 0.5}
+        unit_weight_lbs:               {min: 0.5, max: 3.0}
+        revenue_per_unit:              {min: 50.0, max: 500.0}
+        cogs_per_unit:                 {min: 10.0, max: 100.0}
+        holding_cost_per_unit_per_day: {min: 0.05, max: 0.30}
+
+      - name: "generic pharmaceuticals"
+        unit_cube_ft3:                 {min: 0.1, max: 0.4}
+        unit_weight_lbs:               {min: 0.5, max: 2.5}
+        revenue_per_unit:              {min: 5.0, max: 50.0}
+        cogs_per_unit:                 {min: 2.0, max: 15.0}
+        holding_cost_per_unit_per_day: {min: 0.02, max: 0.10}
+
+      - name: "vaccines"
+        # Cold-chain premium drives the higher holding cost band.
+        unit_cube_ft3:                 {min: 0.1, max: 0.3}
+        unit_weight_lbs:               {min: 0.5, max: 2.0}
+        revenue_per_unit:              {min: 30.0, max: 200.0}
+        cogs_per_unit:                 {min: 8.0, max: 60.0}
+        holding_cost_per_unit_per_day: {min: 0.10, max: 0.50}
+
+      - name: "over-the-counter medicines"
+        unit_cube_ft3:                 {min: 0.2, max: 0.8}
+        unit_weight_lbs:               {min: 1.0, max: 5.0}
+        revenue_per_unit:              {min: 5.0, max: 40.0}
+        cogs_per_unit:                 {min: 1.0, max: 12.0}
+        holding_cost_per_unit_per_day: {min: 0.02, max: 0.10}
+
+      - name: "health and beauty products"
+        unit_cube_ft3:                 {min: 0.3, max: 1.2}
+        unit_weight_lbs:               {min: 1.0, max: 8.0}
+        revenue_per_unit:              {min: 5.0, max: 30.0}
+        cogs_per_unit:                 {min: 1.0, max: 10.0}
+        holding_cost_per_unit_per_day: {min: 0.01, max: 0.08}
+
+      - name: "medical supplies"
+        unit_cube_ft3:                 {min: 0.5, max: 2.0}
+        unit_weight_lbs:               {min: 2.0, max: 12.0}
+        revenue_per_unit:              {min: 10.0, max: 80.0}
+        cogs_per_unit:                 {min: 3.0, max: 25.0}
+        holding_cost_per_unit_per_day: {min: 0.02, max: 0.12}
+
+      - name: "medical equipment"
+        unit_cube_ft3:                 {min: 1.0, max: 3.0}
+        unit_weight_lbs:               {min: 5.0, max: 25.0}
+        revenue_per_unit:              {min: 100.0, max: 1000.0}
+        cogs_per_unit:                 {min: 30.0, max: 300.0}
+        holding_cost_per_unit_per_day: {min: 0.05, max: 0.25}
 
   planning:
     start_date: "2026-05-12"

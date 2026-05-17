@@ -1030,6 +1030,51 @@ def run_optimization(df_products, df_demand, df_inventory, df_capacity,
 
 
 # =============================================================================
+# CATEGORY ROLLUP / SKU DRILL-DOWN HELPER
+# =============================================================================
+def category_or_sku(df, selected_category, sum_cols=(), wavg_cols=(), risk_col=None):
+    """Roll a per-SKU frame up to product_category, or filter it to a single
+    category and return per-SKU rows. Both modes expose a `group_label` column
+    suitable for chart x-axes / table indexes.
+
+    `df` must already have a `product_category` column joined in.
+    - sum_cols:   columns to sum when rolling up.
+    - wavg_cols:  list of (value_col, weight_col) demand-weighted averages.
+    - risk_col:   optional boolean column. In rollup mode it becomes two cols,
+                  `n_at_risk` (sum of true) and `n_total` (group size).
+    """
+    if selected_category is None:
+        agg = {c: "sum" for c in sum_cols}
+        out = (
+            df.groupby("product_category", as_index=False).agg(agg)
+            if agg else
+            df[["product_category"]].drop_duplicates().reset_index(drop=True)
+        )
+        for value_col, weight_col in wavg_cols:
+            w = (
+                df.groupby("product_category")
+                  .apply(lambda g: (g[value_col] * g[weight_col]).sum()
+                                   / max(g[weight_col].sum(), 1))
+                  .rename(value_col)
+                  .reset_index()
+            )
+            out = out.merge(w, on="product_category", how="left")
+        if risk_col is not None:
+            risk = (
+                df.groupby("product_category")
+                  .agg(n_at_risk=(risk_col, "sum"), n_total=(risk_col, "size"))
+                  .reset_index()
+            )
+            out = out.merge(risk, on="product_category", how="left")
+        out["group_label"] = out["product_category"]
+        return out
+
+    sub = df[df["product_category"] == selected_category].copy()
+    sub["group_label"] = sub["sku_id"]
+    return sub
+
+
+# =============================================================================
 # DETAIL VIEW
 # =============================================================================
 def render_detail(dc_id, df_summary):
@@ -1093,12 +1138,28 @@ def render_detail(dc_id, df_summary):
     st.sidebar.markdown(f"{city}, {state_code}")
     st.sidebar.markdown("---")
 
+    # Category drill-down: rolls every per-SKU view in this page up to its
+    # 7 pharma categories by default, or filters to one category's SKUs.
+    # Sticky across DC switches via st.session_state.
+    all_cats = sorted(df_products["product_category"].dropna().unique().tolist())
+    drill_options = ["All categories"] + all_cats
+    if st.session_state.get("selected_category", "All categories") not in drill_options:
+        st.session_state["selected_category"] = "All categories"
+    drill = st.sidebar.selectbox(
+        "Drill into category",
+        options=drill_options,
+        help="Default shows category rollups. Pick one to drill into its SKUs.",
+        key="selected_category",
+    )
+    selected_category = None if drill == "All categories" else drill
+    st.sidebar.markdown("---")
+
     # --- Current Inventory ---
     st.markdown("---")
     st.subheader("\U0001f4e6 Current Inventory Position")
 
     df_inv_enriched = df_inventory.merge(
-        df_products[["sku_id", "unit_cube_ft3", "revenue_per_unit",
+        df_products[["sku_id", "product_category", "unit_cube_ft3", "revenue_per_unit",
                      "holding_cost_per_unit_per_day",
                      "units_per_case", "cases_per_pallet"]],
         on="sku_id", how="left",
@@ -1112,6 +1173,16 @@ def render_detail(dc_id, df_summary):
     df_inv_enriched["daily_holding_cost"] = (
         df_inv_enriched["on_hand_units"] * df_inv_enriched["holding_cost_per_unit_per_day"]
     )
+
+    # Per-SKU total demand over the planning horizon — used both for the
+    # demand-vs-coverage view below and to compute category-level days_of_supply.
+    demand_per_sku = (
+        df_demand.groupby("sku_id", as_index=False)["demand_units"].sum()
+                 .rename(columns={"demand_units": "total_demand_units"})
+    )
+    df_inv_enriched = df_inv_enriched.merge(demand_per_sku, on="sku_id", how="left")
+    df_inv_enriched["total_demand_units"] = df_inv_enriched["total_demand_units"].fillna(0)
+    n_periods = max(int(df_demand["forecast_date"].nunique()), 1)
 
     cap_row = df_capacity.iloc[0]
     total_storage_capacity = float(cap_row["total_storage_cube_ft3"])
@@ -1131,15 +1202,33 @@ def render_detail(dc_id, df_summary):
     inv_col3.metric("Inventory Value", f"${df_inv_enriched['inventory_value'].sum():,.0f}")
     inv_col4.metric("Daily Holding Cost", f"${df_inv_enriched['daily_holding_cost'].sum():,.0f}")
 
+    # Roll up to product_category or filter to one category's SKUs.
+    df_inv_view = category_or_sku(
+        df_inv_enriched,
+        selected_category,
+        sum_cols=("on_hand_units", "available_units", "allocated_units",
+                  "total_cube_ft3", "inventory_value", "daily_holding_cost",
+                  "total_demand_units"),
+    )
+    if selected_category is None:
+        # Category-level days_of_supply = on-hand / average daily demand
+        df_inv_view["days_of_supply"] = df_inv_view.apply(
+            lambda r: r["on_hand_units"] / max(r["total_demand_units"] / n_periods, 1),
+            axis=1,
+        )
+
+    group_axis_label = "Category" if selected_category is None else "SKU"
+    drill_suffix = "" if selected_category is None else f" — {selected_category}"
+
     inv_left, inv_right = st.columns(2)
     with inv_left:
         fig_inv_units = px.bar(
-            df_inv_enriched.sort_values("on_hand_units", ascending=False),
-            x="sku_id", y="on_hand_units",
+            df_inv_view.sort_values("on_hand_units", ascending=False),
+            x="group_label", y="on_hand_units",
             color="days_of_supply",
             color_continuous_scale="RdYlGn",
-            title="On-Hand Inventory by SKU",
-            labels={"on_hand_units": "Units", "sku_id": "SKU",
+            title=f"On-Hand Inventory by {group_axis_label}{drill_suffix}",
+            labels={"on_hand_units": "Units", "group_label": group_axis_label,
                     "days_of_supply": "Days of Supply"},
         )
         fig_inv_units.update_layout(height=350)
@@ -1147,30 +1236,31 @@ def render_detail(dc_id, df_summary):
 
     with inv_right:
         fig_cube = px.bar(
-            df_inv_enriched.sort_values("total_cube_ft3", ascending=False),
-            x="sku_id", y="total_cube_ft3",
-            title="Cube Utilization by SKU (cu ft)",
-            labels={"total_cube_ft3": "Cubic Feet", "sku_id": "SKU"},
+            df_inv_view.sort_values("total_cube_ft3", ascending=False),
+            x="group_label", y="total_cube_ft3",
+            title=f"Cube Utilization by {group_axis_label}{drill_suffix} (cu ft)",
+            labels={"total_cube_ft3": "Cubic Feet", "group_label": group_axis_label},
             color_discrete_sequence=["#636EFA"],
         )
-        if len(df_inv_enriched) > 0:
+        if len(df_inv_view) > 0:
             fig_cube.add_hline(
-                y=total_storage_capacity / len(df_inv_enriched),
+                y=total_storage_capacity / len(df_inv_view),
                 line_dash="dash", line_color="red",
-                annotation_text="Avg capacity per SKU",
+                annotation_text=f"Avg capacity per {group_axis_label.lower()}",
             )
         fig_cube.update_layout(height=350)
         st.plotly_chart(fig_cube, use_container_width=True)
 
     with st.expander("\U0001f4cb Inventory detail table", expanded=False):
-        inv_display = df_inv_enriched[[
-            "sku_id", "on_hand_units", "available_units", "allocated_units",
+        inv_display = df_inv_view[[
+            "group_label", "on_hand_units", "available_units", "allocated_units",
             "days_of_supply", "total_cube_ft3", "inventory_value", "daily_holding_cost",
         ]].copy()
         inv_display.columns = [
-            "SKU", "On-Hand Units", "Available Units", "Allocated Units",
+            group_axis_label, "On-Hand Units", "Available Units", "Allocated Units",
             "Days of Supply", "Cube (cu ft)", "Inventory Value ($)", "Daily Holding Cost ($)",
         ]
+        inv_display["Days of Supply"] = inv_display["Days of Supply"].round(1)
         inv_display["Cube (cu ft)"] = inv_display["Cube (cu ft)"].round(1)
         inv_display["Inventory Value ($)"] = inv_display["Inventory Value ($)"].round(2)
         inv_display["Daily Holding Cost ($)"] = inv_display["Daily Holding Cost ($)"].round(2)
@@ -1192,7 +1282,7 @@ def render_detail(dc_id, df_summary):
         inbound_by_sku = df_inbound.groupby("sku_id")["inbound_units"].sum().reset_index()
 
     df_coverage = (
-        df_inv_enriched[["sku_id", "on_hand_units"]]
+        df_inv_enriched[["sku_id", "product_category", "on_hand_units"]]
         .merge(demand_by_sku, on="sku_id", how="left")
         .merge(inbound_by_sku, on="sku_id", how="left")
     )
@@ -1228,22 +1318,36 @@ def render_detail(dc_id, df_summary):
         delta_color="inverse" if at_risk_count > 0 else "off",
     )
 
+    # Roll up to product_category or filter to one category's SKUs.
+    df_cov_view = category_or_sku(
+        df_coverage,
+        selected_category,
+        sum_cols=("on_hand_units", "inbound_units", "total_supply", "total_demand",
+                  "surplus_deficit"),
+        risk_col="at_risk",
+    )
+    df_cov_view["coverage_ratio"] = np.where(
+        df_cov_view["total_demand"] > 0,
+        (df_cov_view["total_supply"] / df_cov_view["total_demand"]).round(2),
+        np.inf,
+    )
+
     dem_left, dem_right = st.columns(2)
     with dem_left:
-        df_coverage_sorted = df_coverage.sort_values("coverage_ratio")
+        df_cov_sorted = df_cov_view.sort_values("coverage_ratio")
         fig_cov = go.Figure()
         fig_cov.add_trace(go.Bar(
-            x=df_coverage_sorted["sku_id"], y=df_coverage_sorted["on_hand_units"],
+            x=df_cov_sorted["group_label"], y=df_cov_sorted["on_hand_units"],
             name="On-Hand Inventory", marker_color="#636EFA"))
         fig_cov.add_trace(go.Bar(
-            x=df_coverage_sorted["sku_id"], y=df_coverage_sorted["inbound_units"],
+            x=df_cov_sorted["group_label"], y=df_cov_sorted["inbound_units"],
             name="Scheduled Inbound", marker_color="#00CC96"))
         fig_cov.add_trace(go.Bar(
-            x=df_coverage_sorted["sku_id"], y=df_coverage_sorted["total_demand"],
+            x=df_cov_sorted["group_label"], y=df_cov_sorted["total_demand"],
             name=f"Total Demand ({n_planning_days}d)", marker_color="#EF553B",
             opacity=0.7))
         fig_cov.update_layout(
-            title="Inventory + Inbound vs. Forecasted Demand by SKU",
+            title=f"Inventory + Inbound vs. Forecasted Demand by {group_axis_label}{drill_suffix}",
             yaxis_title="Units", barmode="group", height=400,
             legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
         )
@@ -1271,16 +1375,38 @@ def render_detail(dc_id, df_summary):
         )
         st.plotly_chart(fig_daily, use_container_width=True)
 
-    with st.expander("\U0001f50d Coverage detail by SKU", expanded=False):
-        cov_display = df_coverage[[
-            "sku_id", "on_hand_units", "inbound_units", "total_supply",
-            "total_demand", "surplus_deficit", "coverage_ratio", "at_risk",
-        ]].copy()
-        cov_display.columns = [
-            "SKU", "On-Hand", "Inbound", "Total Supply",
-            "Total Demand", "Surplus / Deficit", "Coverage Ratio", "At Risk",
-        ]
-        cov_display["At Risk"] = cov_display["At Risk"].map({True: "⚠️ YES", False: "✅ No"})
+    expander_label = (
+        "\U0001f50d Coverage detail by category"
+        if selected_category is None else
+        f"\U0001f50d Coverage detail by SKU — {selected_category}"
+    )
+    with st.expander(expander_label, expanded=False):
+        if selected_category is None:
+            cov_display = df_cov_view[[
+                "group_label", "on_hand_units", "inbound_units", "total_supply",
+                "total_demand", "surplus_deficit", "coverage_ratio",
+                "n_at_risk", "n_total",
+            ]].copy()
+            cov_display["At Risk"] = cov_display.apply(
+                lambda r: f"⚠️ {int(r['n_at_risk'])} of {int(r['n_total'])}"
+                          if int(r["n_at_risk"]) > 0 else "✅ All covered",
+                axis=1,
+            )
+            cov_display = cov_display.drop(columns=["n_at_risk", "n_total"])
+            cov_display.columns = [
+                "Category", "On-Hand", "Inbound", "Total Supply",
+                "Total Demand", "Surplus / Deficit", "Coverage Ratio", "At Risk",
+            ]
+        else:
+            cov_display = df_cov_view[[
+                "group_label", "on_hand_units", "inbound_units", "total_supply",
+                "total_demand", "surplus_deficit", "coverage_ratio", "at_risk",
+            ]].copy()
+            cov_display["at_risk"] = cov_display["at_risk"].map({True: "⚠️ YES", False: "✅ No"})
+            cov_display.columns = [
+                "SKU", "On-Hand", "Inbound", "Total Supply",
+                "Total Demand", "Surplus / Deficit", "Coverage Ratio", "At Risk",
+            ]
         cov_display = cov_display.sort_values("Coverage Ratio")
         st.dataframe(cov_display, use_container_width=True, hide_index=True)
 
@@ -1511,12 +1637,23 @@ def render_detail(dc_id, df_summary):
             })
             st.dataframe(comp_df, use_container_width=True, hide_index=True)
 
+        fill_tab_label = (
+            "\U0001f4e6 Fill Rate by Category" if selected_category is None
+            else f"\U0001f4e6 Fill Rate — {selected_category}"
+        )
         tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
             "\U0001f4ca Capacity Utilization", "\U0001f69a Outbound Volume",
             "⚠️ Overflow Analysis",
-            "\U0001f4e6 Fill Rate by SKU", "\U0001f477 Labor Allocation",
+            fill_tab_label, "\U0001f477 Labor Allocation",
             "\U0001f4e6 Inventory Trajectory",
         ])
+
+        # Join product_category onto the LP fulfillment frame so the SKU-level
+        # tabs (fill rate, heatmap) can roll up or drill down on the same axis
+        # as the rest of the page.
+        df_ful = df_ful.merge(
+            df_products[["sku_id", "product_category"]], on="sku_id", how="left",
+        )
 
         with tab1:
             fig = go.Figure()
@@ -1627,22 +1764,32 @@ def render_detail(dc_id, df_summary):
             st.dataframe(overflow_qty, use_container_width=True, hide_index=True)
 
         with tab4:
-            sku_agg = df_ful.groupby("sku_id").agg(
+            # First aggregate to per-SKU totals from the LP solution, then
+            # roll up to category (demand-weighted fill rate) or filter to
+            # the chosen category's SKUs.
+            sku_agg = df_ful.groupby(["sku_id", "product_category"], as_index=False).agg(
                 total_demand=("demand", "sum"),
                 total_fulfilled=("fulfilled", "sum"),
                 total_revenue=("revenue", "sum"),
-            ).reset_index()
-            sku_agg["fill_rate"] = np.where(
-                sku_agg["total_demand"] > 0,
-                (sku_agg["total_fulfilled"] / sku_agg["total_demand"] * 100).round(1),
+            )
+            fill_view = category_or_sku(
+                sku_agg,
+                selected_category,
+                sum_cols=("total_demand", "total_fulfilled", "total_revenue"),
+            )
+            # Recompute fill_rate from the rolled-up totals (demand-weighted)
+            fill_view["fill_rate"] = np.where(
+                fill_view["total_demand"] > 0,
+                (fill_view["total_fulfilled"] / fill_view["total_demand"] * 100).round(1),
                 100.0,
             )
-            sku_agg = sku_agg.sort_values("fill_rate")
+            fill_view = fill_view.sort_values("fill_rate")
             fig3 = px.bar(
-                sku_agg, x="sku_id", y="fill_rate",
+                fill_view, x="group_label", y="fill_rate",
                 color="fill_rate", color_continuous_scale="RdYlGn",
                 range_color=[0, 100],
-                title="Demand Fill Rate by SKU",
+                title=f"Demand Fill Rate by {group_axis_label}{drill_suffix}",
+                labels={"group_label": group_axis_label, "fill_rate": "Fill Rate %"},
             )
             fig3.add_hline(y=95, line_dash="dash", annotation_text="95% Target")
             fig3.update_layout(height=400, yaxis_title="Fill Rate %")
@@ -1676,17 +1823,27 @@ def render_detail(dc_id, df_summary):
             )
             st.plotly_chart(fig_inv_traj, use_container_width=True)
 
-            inv_by_sku = df_ful.pivot_table(
-                index="sku_id", columns="period",
+            # Inventory heatmap: 7 categories × periods by default; drill into
+            # one category to see its ~14 SKUs × periods.
+            if selected_category is None:
+                heat_index = "product_category"
+                heat_axis = "Category"
+                heat_data = df_ful
+            else:
+                heat_index = "sku_id"
+                heat_axis = "SKU"
+                heat_data = df_ful[df_ful["product_category"] == selected_category]
+            inv_pivot = heat_data.pivot_table(
+                index=heat_index, columns="period",
                 values="inventory", aggfunc="sum",
             )
             fig_heat = px.imshow(
-                inv_by_sku.values,
-                labels=dict(x="Period", y="SKU", color="Units"),
-                x=list(inv_by_sku.columns),
-                y=list(inv_by_sku.index),
+                inv_pivot.values,
+                labels=dict(x="Period", y=heat_axis, color="Units"),
+                x=list(inv_pivot.columns),
+                y=list(inv_pivot.index),
                 color_continuous_scale="YlOrRd",
-                title="Inventory Heatmap by SKU and Period",
+                title=f"Inventory Heatmap by {heat_axis} and Period{drill_suffix}",
                 aspect="auto",
             )
             fig_heat.update_layout(height=400)
