@@ -21,6 +21,9 @@ Thumbs.db
 *.swp
 *.swo
 
+# Local agent context (not for the public repo)
+CLAUDE.md
+
 # Env / secrets
 .env
 .env.local
