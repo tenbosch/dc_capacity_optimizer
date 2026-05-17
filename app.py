@@ -763,10 +763,30 @@ def render_ndc_detail(dc_id):
                 + ["#636EFA"] * len(dests)
             )
             fig_sankey = go.Figure(go.Sankey(
-                node=dict(label=node_labels, pad=15, thickness=15, color=colors),
-                link=dict(source=src, target=tgt, value=vals),
+                arrangement="snap",
+                node=dict(
+                    label=node_labels,
+                    pad=18,
+                    thickness=18,
+                    color=colors,
+                    line=dict(width=0),
+                ),
+                link=dict(
+                    source=src, target=tgt, value=vals,
+                    color="rgba(150, 150, 150, 0.35)",
+                ),
+                textfont=dict(
+                    size=13,
+                    color="#222",
+                    family="Inter, -apple-system, Helvetica Neue, Arial, sans-serif",
+                ),
             ))
-            fig_sankey.update_layout(height=520)
+            fig_sankey.update_layout(
+                height=520,
+                paper_bgcolor="white",
+                plot_bgcolor="white",
+                margin=dict(l=10, r=10, t=10, b=10),
+            )
             st.plotly_chart(fig_sankey, use_container_width=True)
         else:
             st.caption("Not enough data for Sankey on this day.")
