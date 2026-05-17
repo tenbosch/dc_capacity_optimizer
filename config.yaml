@@ -1,0 +1,194 @@
+# =============================================================================
+# DC Capacity Optimizer — Configuration
+# =============================================================================
+# Single source of truth for synthetic data generation, optimization defaults,
+# and Streamlit app UI controls. Edit values here instead of changing code.
+# =============================================================================
+
+schema: tenbosch.scmo_poc
+
+# -----------------------------------------------------------------------------
+# Synthetic data generation
+# Consumed by the "Generate Synthetic Data" notebook.
+# -----------------------------------------------------------------------------
+synthetic_data:
+  random_seed: 42
+
+  # NOTE: The DC list is sourced from `tenbosch.scmo_poc.distribution_centers`
+  # (filtered to rows where `facility_type = 'Wholesale DC'`), NOT generated here.
+  # To change which DCs are in scope, edit that table — there is no n_dcs config.
+  distribution_centers:
+    facility_type: "Wholesale DC"        # filter applied when reading the table
+
+  skus:
+    n_skus: 100
+    id_prefix: "SKU-"
+    id_padding: 4                       # → SKU-0001 … SKU-0100
+    categories: [Electronics, Apparel, Food, Home]
+    unit_cube_ft3:                  {min: 0.2,  max: 2.0}
+    unit_weight_lbs:                {min: 0.5,  max: 15.0}
+    units_per_case_choices:         [6, 12, 24, 36]
+    cases_per_pallet_choices:       [20, 30, 40, 50]
+    revenue_per_unit:               {min: 8.0,  max: 50.0}
+    cogs_per_unit:                  {min: 3.0,  max: 25.0}
+    holding_cost_per_unit_per_day:  {min: 0.01, max: 0.20}
+
+  planning:
+    start_date: "2026-05-12"
+    n_periods: 30                       # days in the planning horizon
+
+  demand:
+    # Daily demand per SKU. Sized so that 100 SKUs × midpoint(50–250) ≈ 15K
+    # units/day fits comfortably inside dc_capacity.max_daily_throughput_units
+    # (20–40K) and inside the available labor pool. Out-of-bound demand
+    # forces unfulfilled orders → inventory accumulation → runaway storage %.
+    base_units_per_sku:  {min: 50, max: 250}
+    daily_variance:      {min: 0.7, max: 1.3}
+    confidence:          {min: 0.7, max: 0.95}
+    forecast_source: STATISTICAL_MODEL
+
+  inventory:
+    snapshot_date: "2026-05-11"
+    # Inventory is now sized by days_of_supply × avg_daily_demand per (DC, SKU).
+    # This produces realistic on-hand levels that bridge to the next inbound
+    # receipt and keep storage % roughly stable across the horizon. The earlier
+    # `on_hand_units` and `target_storage_utilization` knobs are deprecated.
+    days_of_supply:   {min: 5, max: 10}
+    allocated_ratio: 0.1
+    in_transit_units: {min: 0, max: 500}
+
+  dc_capacity:
+    storage_positions:           {min: 6000,  max: 12000}
+    # Sized so realistic inventory (days_of_supply × demand) lands around 60%
+    # utilization on average. Bumped up from 40-80K — the smaller capacity
+    # would have made the network look chronically over capacity.
+    storage_cube_ft3:            {min: 150000, max: 250000}
+    rack_ratio: 0.75
+    pick_locations:              {min: 1000, max: 2500}
+    inbound_dock_doors:          {min: 8,    max: 18}
+    outbound_dock_doors:         {min: 10,   max: 22}
+    max_daily_inbound_pallets:   {min: 120,  max: 250}
+    max_daily_outbound_pallets:  {min: 150,  max: 300}
+    max_daily_inbound_cases:     {min: 4000, max: 7000}
+    max_daily_outbound_cases:    {min: 5000, max: 8000}
+    max_daily_throughput_units:  {min: 20000, max: 40000}
+    max_concurrent_trailers:     {min: 15, max: 30}
+    utilization_target_pct: 0.85
+
+  labor:
+    functions: [RECEIVING, PICKING, PACKING, SHIPPING]
+    shift_id: "1ST"
+    headcount_per_function: {min: 15, max: 30}
+    hours_per_shift: 8.0
+    available_factor: {min: 0.85, max: 0.95}
+    overtime_factor: 0.25
+    labor_cost_per_hour: 25.0
+    overtime_cost_per_hour: 37.5
+    temp_labor_hours: {min: 20, max: 60}
+    temp_labor_cost_per_hour: 30.0
+
+  throughput:
+    units_per_labor_hour: {min: 30, max: 80}
+    rate_source: ENGINEERED_STANDARD
+
+  inbound:
+    # Demand-aware inbound: each (DC, SKU)'s receipts over the horizon total
+    # ≈ total_demand_units × coverage_ratio, split across n_receipts_per_horizon
+    # arrival days. Keeps storage % roughly stable instead of climbing.
+    coverage_ratio:          {min: 0.95, max: 1.05}
+    n_receipts_per_horizon:  {min: 4, max: 12}
+    supplier_id:             {min: 100, max: 200}
+
+  outbound:
+    probability_per_sku_day: 0.7
+    units:                   {min: 200, max: 2000}
+    priorities: [CRITICAL, HIGH, MEDIUM, LOW]
+    carriers:   [FedEx, UPS, XPO, SAIA]
+
+# -----------------------------------------------------------------------------
+# National Distribution Center (NDC) — pharma cross-dock tier above the WDCs.
+# Pharma manufacturers ship into the NDC; everything must depart for a WDC
+# within `sla_dwell_hours` (24h). No storage at the NDC by spec.
+# Consumed by the generator notebook (ndc_capacity, ndc_inbound, ndc_outbound)
+# and by the app's NDC detail view (which also runs a pure-Python what-if
+# simulator on top of these tables).
+# -----------------------------------------------------------------------------
+ndc:
+  active_dc_ids: ["DC-101"]              # extend to DC-102 once DC-101 settles
+
+  capacity:
+    max_hourly_inbound_pallets:    {min: 80, max: 120}
+    max_hourly_outbound_pallets:   {min: 80, max: 120}
+    max_hourly_throughput_pallets: {min: 70, max: 110}
+    inbound_dock_doors:            {min: 20, max: 32}
+    outbound_dock_doors:           {min: 24, max: 36}
+    sla_dwell_hours: 24.0
+
+  simulation:
+    daily_inbound_pallets:   {min: 1400, max: 2000}   # ≈ 60-85 pallets/hr avg
+    pallets_per_pharma_load: {min: 18,   max: 26}
+    suppliers:
+      [Pfizer, Merck, AbbVie, JnJ, Lilly, Roche, Novartis, BMS, GSK, Sanofi]
+    manufacturer_carriers:
+      [PharmaExpress, MedFreight, ColdChainLogix, RxLine, SafeShip]
+    # 24 hour-of-day weights (0=midnight … 23=11pm); skew toward daytime.
+    arrival_pattern_hour_weights:
+      [1, 1, 1, 2, 3, 5, 7, 9, 9, 8, 7, 6, 7, 8, 7, 6, 5, 4, 3, 2, 2, 1, 1, 1]
+    dwell_hours_mean: 14.0
+    dwell_hours_stddev: 6.0
+    dwell_hours_max: 30.0                # truncates the tail
+    sla_miss_target_pct: 0.07            # ≈ 7% of pallets exceed 24h
+
+# -----------------------------------------------------------------------------
+# Optimization defaults
+# Consumed by the optimization notebook and app.py.
+# -----------------------------------------------------------------------------
+optimization:
+  default_regular_labor_cost_per_hour: 25.0
+  default_overtime_labor_cost_per_hour: 37.5
+  default_max_regular_hours_per_period: 800.0
+  default_max_overtime_hours_per_period: 200.0
+  default_throughput_rate_units_per_hour: 50.0
+
+  # Solvers attempted in order; first one that imports wins.
+  # HiGHS is 5–20× faster than CBC on LPs of this shape.
+  solver_preference: ["highs", "cbc"]
+
+  penalties:
+    storage: 5.0        # $ / cu ft / day
+    throughput: 2.0     # $ / unit
+    outbound: 50.0      # $ / pallet
+    inbound: 75.0       # $ / pallet
+
+  # Used only when a dc_capacity row is missing for a given DC
+  fallback_capacities:
+    max_storage: 100000.0
+    max_daily_throughput: 50000.0
+    max_inbound_pallets: 200.0
+    max_outbound_pallets: 250.0
+
+  # Placeholder — opt-in aggregation knobs for the future "thousands of SKUs"
+  # path. When enabled, the LP solves at SKU-level for the top-N SKUs by demand
+  # and rolls the rest up to the chosen dimension. No code path consumes these
+  # yet; documented here so a follow-up PR can wire it without a schema change.
+  aggregation:
+    enabled: false
+    top_n_skus: 500
+    rollup_other_to: "product_category"
+
+# -----------------------------------------------------------------------------
+# Streamlit app UI
+# Consumed by app.py.
+# -----------------------------------------------------------------------------
+app:
+  cache_ttl_seconds: 300
+
+  penalty_sliders:
+    storage:    {min: 0.0, max: 25.0,  default: 5.0,  step: 0.5}
+    throughput: {min: 0.0, max: 10.0,  default: 2.0,  step: 0.25}
+    outbound:   {min: 0.0, max: 200.0, default: 50.0, step: 5.0}
+    inbound:    {min: 0.0, max: 200.0, default: 75.0, step: 5.0}
+
+  capacity_multipliers:
+    storage:    {min: 0.5, max: 3.0, default: 1.0, step: 0.1}
+    throughput: {min: 0.5, max: 3.0, default: 1.0, step: 0.1}

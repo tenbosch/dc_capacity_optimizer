@@ -1,0 +1,12 @@
+bundle:
+  name: dc-capacity-optimizer-react
+
+resources:
+  apps:
+    dc-capacity-optimizer-react:
+      name: dc-capacity-optimizer-react
+      source_code_path: .
+
+targets:
+  dev:
+    default: true

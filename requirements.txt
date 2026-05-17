@@ -1,0 +1,7 @@
+streamlit>=1.31
+pulp>=2.7
+highspy>=1.7
+plotly>=5.18
+databricks-sql-connector>=3.0
+databricks-sdk>=0.20
+pyyaml>=6.0
