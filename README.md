@@ -213,7 +213,7 @@ databricks bundle deploy -t dev
 
 **Pipeline order** (do this first time only):
 
-1. Ensure `tenbosch.scmo_poc.distribution_centers` exists (the DC identity table).
+1. Set `schema` in `config.yaml` to the `<catalog>.<schema>` that contains your `distribution_centers` table (the DC identity table). The generator and app read every other table as `<schema>.<table>`.
 2. Run `Generate Synthetic Data` notebook → populates all 12 input tables with constraints + comments.
 3. (Optional) Run `DC Capacity Optimization Model` notebook → reference per-DC LP solve, persists results.
 4. Open the deployed Databricks App → re-solve interactively from the sidebar.
