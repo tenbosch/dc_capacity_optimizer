@@ -83,8 +83,8 @@ synthetic_data:
         holding_cost_per_unit_per_day: {min: 0.05, max: 0.25}
 
   planning:
-    start_date: "2026-05-12"
-    n_periods: 30                       # days in the planning horizon
+    start_date: "2025-05-17"
+    n_periods: 366                      # days in the planning horizon (1 year + today)
 
   demand:
     # Daily demand per SKU. Sized so that 100 SKUs × midpoint(50–250) ≈ 15K
@@ -97,7 +97,7 @@ synthetic_data:
     forecast_source: STATISTICAL_MODEL
 
   inventory:
-    snapshot_date: "2026-05-11"
+    snapshot_date: "2025-05-16"
     # Inventory is now sized by days_of_supply × avg_daily_demand per (DC, SKU).
     # This produces realistic on-hand levels that bridge to the next inbound
     # receipt and keep storage % roughly stable across the horizon. The earlier

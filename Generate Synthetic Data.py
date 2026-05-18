@@ -254,7 +254,7 @@ for dc in dc_ids:
     floor_positions = storage_positions - rack_positions
     capacity_rows.append({
         "dc_id": dc,
-        "effective_date": date(2026, 1, 1),
+        "effective_date": date(2025, 1, 1),
         "total_storage_positions": storage_positions,
         "total_storage_cube_ft3": round(float(runif(cap_cfg["storage_cube_ft3"])), 2),
         "rack_positions": rack_positions,
@@ -550,7 +550,7 @@ for dc in dc_ids:
             uph,
             round(uph / prod["units_per_case"], 1),
             round(uph / (prod["units_per_case"] * prod["cases_per_pallet"]), 2),
-            date(2026, 1, 1),
+            date(2025, 1, 1),
             None,
             tp_cfg["rate_source"],
             NOW,
@@ -823,7 +823,7 @@ for dc in dc_ids:
     for cat, name, value, unit, desc in param_specs:
         params_rows.append((
             str(uuid.uuid4()), dc, cat, name, float(value), unit, desc,
-            date(2026, 1, 1), None, NOW,
+            date(2025, 1, 1), None, NOW,
         ))
 
 spark.sql(f"DROP TABLE IF EXISTS {SCHEMA}.optimization_parameters")
@@ -903,7 +903,7 @@ if NDC_CFG and NDC_CFG.get("active_dc_ids"):
         for ndc_id in df_ndc_meta["dc_id"]:
             ndc_capacity_rows.append((
                 ndc_id,
-                date(2026, 1, 1),
+                date(2025, 1, 1),
                 int(rint(cap_cfg["max_hourly_inbound_pallets"])),
                 int(rint(cap_cfg["max_hourly_outbound_pallets"])),
                 int(rint(cap_cfg["max_hourly_throughput_pallets"])),
