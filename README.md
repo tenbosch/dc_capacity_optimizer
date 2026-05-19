@@ -36,6 +36,8 @@ subject to hard constraints (inventory balance, demand ceiling, labor capacity) 
 
 The NDC is modeled separately as a pure-Python what-if simulator over hourly arrival patterns; its outputs feed a Sankey diagram and a dwell-time histogram.
 
+A **Forecast Accuracy** dashboard layered on top of the LP compares historical forecasts to realized demand (MAPE, bias %, fill-rate accuracy) at network and per-DC granularity, then drills into three variance-driver categories — demand shifts, inventory imbalance, and transportation reliability — so the next conversation is "why did the forecast miss?" rather than "what's the forecast?"
+
 ---
 
 ## Repo layout
@@ -72,6 +74,9 @@ Top-level sections:
 | `schema` | Unity Catalog schema for all tables (`tenbosch.scmo_poc`). |
 | `synthetic_data` | Ranges & choices used by the generator (n_skus, planning horizon, demand, inventory, DC capacity envelopes, labor, inbound, outbound). |
 | `synthetic_data.skus.categories` | **Per-category economic ranges.** Each of the 7 pharma categories (brand-name pharma, generic pharma, vaccines, OTC, health & beauty, medical supplies, medical equipment) has its own dimensional and economic sub-ranges (cube, weight, revenue, COGS, holding cost). Each SKU draws its category uniformly, then its params from that category's ranges. |
+| `synthetic_data.planning.history_days` | Days of historical actuals to emit alongside the forward planning horizon. Powers the Forecast Accuracy dashboard. |
+| `synthetic_data.demand.accuracy` | Per-SKU MAPE and bias % ranges used to perturb the forecast into historical `actual_units`. |
+| `synthetic_data.inbound.actuals` / `synthetic_data.outbound.actuals` | On-time rate, delay-day range, and fill-rate range used to populate `actual_date` / `actual_units` on historical receipts and shipments. Drives the transportation-driver KPIs. |
 | `ndc` | NDC tier definition — active NDC IDs, hourly capacity / dock doors, simulation parameters (daily inbound pallets, arrival hour-of-day weights, dwell distribution, SLA miss target). |
 | `optimization` | LP defaults (regular/overtime labor cost, max hours, throughput rate), slack penalty weights, solver preference (HiGHS first, then CBC), and fallback capacities. |
 | `app` | Streamlit UI — cache TTL, slider min/max/default/step for sidebar what-if controls. |
@@ -90,12 +95,12 @@ Run this first. It populates the input tables every other piece consumes.
 |---|---|---|
 | `product_master` | one row per SKU | catalog: pharma category, dimensions, unit economics |
 | `dc_capacity` | one row per WDC | storage / dock door / throughput envelope |
-| `demand_forecast` | (DC, SKU, day) | daily demand forecast over the planning horizon |
+| `demand_forecast` | (DC, SKU, day) | daily demand forecast over the planning horizon, with `actual_units` populated for the historical window (NULL on the forward plan) |
 | `inventory_levels` | (DC, SKU) snapshot | on-hand inventory sized by days-of-supply × avg demand |
 | `labor_availability` | (DC, shift, function, day) | RECEIVING / PICKING / PACKING / SHIPPING headcount + hours |
 | `throughput_rates` | (DC, SKU) | units / cases / pallets per labor hour |
-| `inbound_plan` | one row per receipt | demand-aware receipts so horizon receipts ≈ horizon demand |
-| `outbound_plan` | one row per shipment | planned outbound with priority + carrier |
+| `inbound_plan` | one row per receipt | demand-aware receipts so horizon receipts ≈ horizon demand; past rows carry `actual_date` + `actual_units` driven by carrier on-time / fill-rate config |
+| `outbound_plan` | one row per shipment | planned outbound with priority + carrier; past rows carry `actual_ship_date` + `actual_units` |
 | `optimization_parameters` | per-DC tunables | objective / constraint / weight params for the LP |
 | `ndc_capacity` | one row per NDC | hourly throughput, dock doors, SLA dwell ceiling |
 | `ndc_inbound` | one row per arriving pallet | with timestamp + carrier |
@@ -118,6 +123,15 @@ Reference per-DC LP solver. Loops over every WDC in `dc_capacity`, builds the LP
 
 The app re-implements the same LP internally in `run_optimization()` (app.py) so it can re-solve on-demand from the sidebar — keep them in sync if you change the objective or constraints.
 
+In addition to the LP results, the notebook materializes two derived Delta tables for the Forecast Accuracy story:
+
+| Table | Granularity | Purpose |
+|---|---|---|
+| `forecast_accuracy_network` | one row per DC + a `NETWORK` rollup row | MAPE, bias %, fill-rate accuracy, at-risk SKU count over the history window |
+| `forecast_accuracy_daily` | (DC, day) | daily MAPE / bias trend for time-series dashboards |
+
+The same SQL the app uses inline lives in this notebook, so app KPIs and these tables agree row-for-row. A Lakeview dashboard, Genie, or ad-hoc SQL can consume the accuracy story without launching the app.
+
 Mathematical formulation (also rendered in the notebook):
 
 - **Decision variables**: $f_{it}$ (fulfilled units SKU $i$ in period $t$), $I_{it}$ (ending inventory), $L_t$, $O_t$ (regular and overtime labor hours), $s_{kt}$ (slack overflow for each soft constraint).
@@ -131,7 +145,7 @@ Mathematical formulation (also rendered in the notebook):
 
 Deployed as a Databricks App; `app.yaml` declares the entrypoint and binds the `sql-warehouse` resource to the `DATABRICKS_WAREHOUSE_ID` environment variable.
 
-Three views, switched via session state:
+Four views, switched via session state:
 
 ### 1. Network map
 Every DC plotted on a US map. WDCs are colored by current storage utilization (green → red). NDC pins (blue) open a dedicated NDC detail view. Click any DC to drill in.
@@ -140,6 +154,7 @@ Every DC plotted on a US map. WDCs are colored by current storage utilization (g
 Per-DC dashboard:
 - **Current Inventory Position** — units, cube, value, holding cost; charts by category (default) or by SKU (drill-down).
 - **Demand vs Coverage** — supply (on-hand + inbound) vs total horizon demand, with an at-risk flag rollup.
+- **Forecast Accuracy** (expander) — MAPE / bias % / fill-rate / at-risk SKU KPIs scoped to this DC, a forecast-vs-actual grouped bar and bias diverging bar (both honor the category Rollup / Drill toggle), and a SKU × week MAPE heatmap when drilled into a category. Three nested tabs surface the **variance drivers**: demand shifts (WoW deltas, top-10 SKUs by error), inventory drivers (lowest days-of-supply SKUs), and transportation drivers (on-time inbound/outbound %, average delay days, per-carrier and per-supplier reliability bar).
 - **Outbound Throughput** — pallets / units shipped per day vs dock capacity, including carrier mix.
 - **What-if sidebar** — penalty cost sliders, capacity multipliers, optional scenario comparison. **Re-runs the LP on click** and displays:
   - Capacity utilization by period (4 constraints)
@@ -151,7 +166,10 @@ Per-DC dashboard:
 
 **Category drill-down**: a sticky sidebar selector flips every SKU-level view between a 7-row category rollup and a per-SKU drill of one category's ~14 SKUs. The LP still solves at SKU granularity — only the display granularity changes. The selection persists across DC switches (`st.session_state["selected_category"]`).
 
-### 3. National DC cross-dock (`render_ndc_detail`)
+### 3. Network Forecast Accuracy (`render_accuracy_network`)
+Reached from a button on the network map. Network-wide MAPE / bias % / fill-rate accuracy KPIs, a daily MAPE-and-bias trend line, and a DC ranking bar colored by bias direction. Click any DC to drill into its accuracy detail (jumps to the per-DC view with the accuracy section pre-expanded).
+
+### 4. National DC cross-dock (`render_ndc_detail`)
 Pharma → NDC → WDC flow:
 - **Day selector** — pick any day in the horizon.
 - **Hourly inbound vs outbound** — pallets per hour with the per-hour throughput ceiling.
