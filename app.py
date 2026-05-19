@@ -46,8 +46,18 @@ if "selected_dc" not in st.session_state:
 # =============================================================================
 # DATABASE CONNECTION + QUERY HELPERS
 # =============================================================================
-@st.cache_resource
-def get_connection():
+# We intentionally do NOT cache the SQL connection across reruns. A long-lived
+# connection holds an OAuth token + TCP/TLS socket that both expire while the
+# app sits idle (e.g. overnight). When the user comes back the next day, the
+# cached connection is dead and the failure mode isn't always classifiable
+# from the exception text, so the app stays broken until redeploy. Opening a
+# fresh connection per query lets `databricks.sdk.Config` mint a current
+# token every time. The cost is small (~hundreds of ms) and is already hidden
+# behind `@st.cache_data` on the loaders, which is what actually keeps the
+# app fast. The SQL warehouse session stays warm server-side regardless.
+
+
+def _open_connection():
     cfg = Config()
     warehouse_id = os.getenv("DATABRICKS_WAREHOUSE_ID")
     if not warehouse_id:
@@ -63,35 +73,23 @@ def get_connection():
     )
 
 
-_STALE_CONN_KEYWORDS = (
-    "closed", "expired", "invalid session", "connection",
-    "timeout", "eof", "broken pipe", "reset by peer",
-    "ssl", "token", "unauthorized", "403", "401",
-)
-
-
 def _run_query(sql_text, params=None):
-    conn = get_connection()
-    cursor = conn.cursor()
-    try:
-        cursor.execute(sql_text, params or {})
-        columns = [desc[0] for desc in cursor.description]
-        data = cursor.fetchall()
-        return pd.DataFrame(data, columns=columns)
-    finally:
-        cursor.close()
+    with _open_connection() as conn:
+        with conn.cursor() as cursor:
+            cursor.execute(sql_text, params or {})
+            columns = [desc[0] for desc in cursor.description]
+            data = cursor.fetchall()
+            return pd.DataFrame(data, columns=columns)
 
 
 def run_query(sql_text, params=None):
-    """Run a SQL query with automatic reconnect on stale connections."""
+    """Run a SQL query. Retries once on transient errors (warehouse cold-start,
+    network blip) — auth/connection staleness is already handled by opening a
+    fresh connection inside `_run_query`."""
     try:
         return _run_query(sql_text, params)
-    except Exception as e:
-        msg = str(e).lower()
-        if any(k in msg for k in _STALE_CONN_KEYWORDS):
-            get_connection.clear()
-            return _run_query(sql_text, params)
-        raise
+    except Exception:
+        return _run_query(sql_text, params)
 
 
 # =============================================================================
@@ -144,6 +142,7 @@ def load_network_summary():
              COUNT(DISTINCT sku_id)         AS n_skus,
              COUNT(DISTINCT forecast_date)  AS n_periods
       FROM {SCHEMA}.demand_forecast
+      WHERE actual_units IS NULL              -- forward planning horizon only
       GROUP BY dc_id
     ) dem USING (dc_id)
     WHERE d.facility_type = %(facility_filter)s
@@ -176,13 +175,19 @@ def load_product_master():
 def load_dc_data(dc_id):
     """Load every per-DC table filtered to the chosen DC. Cached per dc_id."""
     tables = {
-        "demand_forecast": "SELECT * FROM {schema}.demand_forecast WHERE dc_id = %(dc_id)s",
+        "demand_forecast":
+            "SELECT * FROM {schema}.demand_forecast "
+            "WHERE dc_id = %(dc_id)s AND actual_units IS NULL",
         "inventory_levels": "SELECT * FROM {schema}.inventory_levels WHERE dc_id = %(dc_id)s",
         "dc_capacity": "SELECT * FROM {schema}.dc_capacity WHERE dc_id = %(dc_id)s",
         "labor_availability": "SELECT * FROM {schema}.labor_availability WHERE dc_id = %(dc_id)s",
         "throughput_rates": "SELECT * FROM {schema}.throughput_rates WHERE dc_id = %(dc_id)s",
-        "inbound_plan": "SELECT * FROM {schema}.inbound_plan WHERE dc_id = %(dc_id)s",
-        "outbound_plan": "SELECT * FROM {schema}.outbound_plan WHERE dc_id = %(dc_id)s",
+        "inbound_plan":
+            "SELECT * FROM {schema}.inbound_plan "
+            "WHERE dc_id = %(dc_id)s AND actual_date IS NULL",
+        "outbound_plan":
+            "SELECT * FROM {schema}.outbound_plan "
+            "WHERE dc_id = %(dc_id)s AND actual_ship_date IS NULL",
         "optimization_parameters":
             "SELECT * FROM {schema}.optimization_parameters WHERE dc_id = %(dc_id)s",
         "distribution_centers":
@@ -275,6 +280,164 @@ def load_ndc_data(dc_id):
     for name, tpl in tables.items():
         out[name] = run_query(tpl.format(schema=SCHEMA), {"dc_id": dc_id})
     return out
+
+
+# =============================================================================
+# FORECAST ACCURACY LOADERS
+# =============================================================================
+# All loaders filter on `actual_units IS NOT NULL`, which is how the generator
+# tags historical demand rows. mape, bias_pct, and fill_rate_accuracy are
+# weighted by actual_units so high-volume SKUs dominate the metric.
+_ACC_RISK_THRESHOLD = 0.30   # SKU-level MAPE above this counts as "at risk"
+
+
+@st.cache_data(ttl=APP_CFG["cache_ttl_seconds"], show_spinner=False)
+def load_accuracy_network():
+    """One row per DC: weighted MAPE, bias, fill-rate accuracy, at-risk SKU count
+    over the history window."""
+    query = f"""
+    WITH hist AS (
+      SELECT
+        f.dc_id,
+        f.sku_id,
+        f.demand_units,
+        f.actual_units,
+        ABS(f.demand_units - f.actual_units)           AS abs_err,
+        (f.demand_units - f.actual_units)              AS signed_err,
+        LEAST(f.demand_units, f.actual_units)          AS fill_units
+      FROM {SCHEMA}.demand_forecast f
+      WHERE f.actual_units IS NOT NULL
+    ),
+    per_sku AS (
+      SELECT
+        dc_id,
+        sku_id,
+        SUM(abs_err) / NULLIF(SUM(actual_units), 0) AS sku_mape
+      FROM hist
+      GROUP BY dc_id, sku_id
+    )
+    SELECT
+      d.dc_id,
+      d.facility_name,
+      d.city,
+      d.state_code,
+      d.region,
+      SUM(h.abs_err)    / NULLIF(SUM(h.actual_units), 0) AS mape,
+      SUM(h.signed_err) / NULLIF(SUM(h.actual_units), 0) AS bias_pct,
+      SUM(h.fill_units) / NULLIF(SUM(h.actual_units), 0) AS fill_rate_accuracy,
+      SUM(h.actual_units)                                AS total_actual_units,
+      SUM(h.demand_units)                                AS total_forecast_units,
+      COUNT(DISTINCT h.sku_id)                           AS n_skus,
+      COUNT(DISTINCT s.sku_id) FILTER (WHERE s.sku_mape > {_ACC_RISK_THRESHOLD})
+                                                         AS n_at_risk_skus
+    FROM {SCHEMA}.distribution_centers d
+    JOIN hist h        USING (dc_id)
+    LEFT JOIN per_sku s USING (dc_id, sku_id)
+    WHERE d.facility_type = %(facility_filter)s
+    GROUP BY d.dc_id, d.facility_name, d.city, d.state_code, d.region
+    ORDER BY d.dc_id
+    """
+    df = run_query(query, {"facility_filter": FACILITY_FILTER})
+    for col in ("mape", "bias_pct", "fill_rate_accuracy",
+                "total_actual_units", "total_forecast_units",
+                "n_skus", "n_at_risk_skus"):
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0).astype(float)
+    return df
+
+
+@st.cache_data(ttl=APP_CFG["cache_ttl_seconds"], show_spinner=False)
+def load_accuracy_daily(dc_id=None):
+    """Daily MAPE / bias series for the trend chart. If dc_id is None, network-wide."""
+    where = "WHERE actual_units IS NOT NULL"
+    params = {}
+    if dc_id is not None:
+        where += " AND dc_id = %(dc_id)s"
+        params["dc_id"] = dc_id
+    query = f"""
+    SELECT
+      forecast_date,
+      SUM(ABS(demand_units - actual_units))   / NULLIF(SUM(actual_units), 0) AS mape,
+      SUM(demand_units - actual_units)        / NULLIF(SUM(actual_units), 0) AS bias_pct,
+      SUM(actual_units)   AS actual_units,
+      SUM(demand_units)   AS forecast_units
+    FROM {SCHEMA}.demand_forecast
+    {where}
+    GROUP BY forecast_date
+    ORDER BY forecast_date
+    """
+    df = run_query(query, params)
+    for col in ("mape", "bias_pct", "actual_units", "forecast_units"):
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0).astype(float)
+    return df
+
+
+@st.cache_data(ttl=APP_CFG["cache_ttl_seconds"], show_spinner=False)
+def load_dc_accuracy(dc_id):
+    """Per-SKU history rows for one DC with derived error metrics, joined with
+    product_master for category drill-down."""
+    query = f"""
+    SELECT
+      f.forecast_date,
+      f.sku_id,
+      p.product_category,
+      f.demand_units                     AS forecast_units,
+      f.actual_units                     AS actual_units,
+      ABS(f.demand_units - f.actual_units) AS abs_error_units,
+      (f.demand_units - f.actual_units)  AS signed_error_units
+    FROM {SCHEMA}.demand_forecast f
+    JOIN {SCHEMA}.product_master p USING (sku_id)
+    WHERE f.dc_id = %(dc_id)s AND f.actual_units IS NOT NULL
+    ORDER BY f.forecast_date, f.sku_id
+    """
+    df = run_query(query, {"dc_id": dc_id})
+    for col in ("forecast_units", "actual_units",
+                "abs_error_units", "signed_error_units"):
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0).astype(float)
+    return df
+
+
+@st.cache_data(ttl=APP_CFG["cache_ttl_seconds"], show_spinner=False)
+def load_transport_actuals(dc_id):
+    """Inbound + outbound historical actuals for one DC, with on-time flags and
+    delay days derived from actual_date - scheduled_date."""
+    inb_q = f"""
+    SELECT
+      'inbound' AS direction,
+      sku_id,
+      supplier_id    AS partner_id,
+      scheduled_date AS scheduled_date,
+      actual_date    AS actual_date,
+      DATEDIFF(actual_date, scheduled_date) AS delay_days,
+      inbound_units  AS planned_units,
+      actual_units   AS actual_units
+    FROM {SCHEMA}.inbound_plan
+    WHERE dc_id = %(dc_id)s AND actual_date IS NOT NULL
+    """
+    out_q = f"""
+    SELECT
+      'outbound' AS direction,
+      sku_id,
+      carrier_id     AS partner_id,
+      scheduled_ship_date AS scheduled_date,
+      actual_ship_date    AS actual_date,
+      DATEDIFF(actual_ship_date, scheduled_ship_date) AS delay_days,
+      outbound_units AS planned_units,
+      actual_units   AS actual_units
+    FROM {SCHEMA}.outbound_plan
+    WHERE dc_id = %(dc_id)s AND actual_ship_date IS NOT NULL
+    """
+    df_in = run_query(inb_q, {"dc_id": dc_id})
+    df_out = run_query(out_q, {"dc_id": dc_id})
+    df = pd.concat([df_in, df_out], ignore_index=True) if not df_in.empty or not df_out.empty else pd.DataFrame()
+    for col in ("delay_days", "planned_units", "actual_units"):
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0).astype(float)
+    if not df.empty:
+        df["on_time"] = df["delay_days"] <= 0
+    return df
 
 
 # =============================================================================
@@ -485,6 +648,13 @@ def render_map(df_summary, df_ndc_summary=None):
     # not propagate on first interaction; this gives the user a deterministic
     # way to drill in. Includes both WDCs and NDCs.
     st.markdown("---")
+    acc_col, _ = st.columns([1, 2])
+    with acc_col:
+        if st.button("\U0001f4ca View network forecast accuracy",
+                     use_container_width=True, key="open_accuracy"):
+            st.session_state["view"] = "accuracy"
+            st.session_state["selected_dc"] = None
+            st.rerun()
     pick_col, _ = st.columns([1, 2])
     with pick_col:
         rows = []
@@ -584,6 +754,135 @@ def simulate_ndc_dispatch(df_inbound_day, capacity_per_hour, vol_mult=1.0,
         "total_inbound": int(hourly_inb.sum()),
         "total_outbound": int(hourly_out.sum()),
     }
+
+
+# =============================================================================
+# NETWORK-LEVEL FORECAST ACCURACY VIEW
+# =============================================================================
+def render_accuracy_network(df_summary):
+    top = st.columns([1, 4])
+    with top[0]:
+        if st.button("← Back to map", use_container_width=True, key="acc_back"):
+            st.session_state["view"] = "map"
+            st.session_state["selected_dc"] = None
+            st.rerun()
+
+    st.markdown("### \U0001f4ca Network Forecast Accuracy")
+    st.caption(
+        "Weighted forecast-vs-actuals over the historical window. MAPE is the "
+        "weighted mean absolute percent error; bias is positive when we "
+        "over-forecast. Click a DC row at the bottom to drill into variance drivers."
+    )
+
+    with st.status("Loading accuracy metrics...", expanded=False) as status:
+        try:
+            df_dc = load_accuracy_network()
+            df_daily = load_accuracy_daily()
+            status.update(label=f"Loaded {len(df_dc)} DCs", state="complete")
+        except Exception as e:
+            status.update(label="Failed to load accuracy data", state="error")
+            st.error(f"Could not load accuracy data: {e}")
+            return
+
+    if df_dc.empty or df_daily.empty:
+        st.warning(
+            "No historical demand actuals found. Re-run the "
+            "'Generate Synthetic Data' notebook so `demand_forecast.actual_units` "
+            "is populated for the history window."
+        )
+        return
+
+    total_actual = df_dc["total_actual_units"].sum()
+    total_forecast = df_dc["total_forecast_units"].sum()
+    net_mape = float((df_dc["mape"] * df_dc["total_actual_units"]).sum()
+                     / max(total_actual, 1))
+    net_bias = float(((df_dc["bias_pct"] * df_dc["total_actual_units"]).sum())
+                     / max(total_actual, 1))
+    net_fill = float((df_dc["fill_rate_accuracy"] * df_dc["total_actual_units"]).sum()
+                     / max(total_actual, 1))
+    at_risk = int(df_dc["n_at_risk_skus"].sum())
+
+    k1, k2, k3, k4 = st.columns(4)
+    k1.metric("Network MAPE",          f"{net_mape * 100:.1f}%")
+    k2.metric("Bias %",                f"{net_bias * 100:+.1f}%",
+              help="Positive = over-forecast on average; negative = under-forecast.")
+    k3.metric("Fill-rate accuracy",    f"{net_fill * 100:.1f}%")
+    k4.metric("At-risk SKUs",          f"{at_risk:,}",
+              help=f"Distinct (DC, SKU) pairs with MAPE > {_ACC_RISK_THRESHOLD * 100:.0f}%.")
+
+    st.markdown("---")
+    st.markdown("#### Daily MAPE trend")
+    fig_trend = go.Figure()
+    fig_trend.add_trace(go.Scatter(
+        x=df_daily["forecast_date"],
+        y=df_daily["mape"] * 100,
+        mode="lines",
+        name="MAPE %",
+        line=dict(color="#d62728", width=2),
+    ))
+    fig_trend.add_trace(go.Scatter(
+        x=df_daily["forecast_date"],
+        y=df_daily["bias_pct"] * 100,
+        mode="lines",
+        name="Bias %",
+        line=dict(color="#1f77b4", width=2, dash="dot"),
+    ))
+    fig_trend.update_layout(
+        height=320,
+        margin=dict(l=10, r=10, t=10, b=10),
+        yaxis=dict(title="%"),
+        xaxis=dict(title=""),
+        legend=dict(orientation="h", y=1.1),
+    )
+    st.plotly_chart(fig_trend, use_container_width=True)
+
+    st.markdown("---")
+    st.markdown("#### DC ranking — MAPE (worst at top)")
+    df_rank = df_dc.sort_values("mape", ascending=False).copy()
+    df_rank["mape_pct"] = df_rank["mape"] * 100
+    df_rank["bias_pct_display"] = df_rank["bias_pct"] * 100
+    fig_rank = px.bar(
+        df_rank,
+        x="mape_pct",
+        y="dc_id",
+        orientation="h",
+        color="bias_pct_display",
+        color_continuous_scale="RdBu_r",
+        color_continuous_midpoint=0,
+        labels={"mape_pct": "MAPE %", "dc_id": "DC", "bias_pct_display": "Bias %"},
+        hover_data={
+            "facility_name": True,
+            "n_skus": True,
+            "n_at_risk_skus": True,
+            "mape_pct": ":.1f",
+            "bias_pct_display": ":.1f",
+        },
+    )
+    fig_rank.update_layout(
+        height=max(220, 28 * len(df_rank)),
+        margin=dict(l=10, r=10, t=10, b=10),
+        yaxis=dict(autorange="reversed"),
+    )
+    st.plotly_chart(fig_rank, use_container_width=True)
+
+    st.markdown("---")
+    st.markdown("#### Drill into a DC")
+    pick_col, _ = st.columns([1, 2])
+    with pick_col:
+        labels = [f"{r.dc_id} — {r.facility_name} (MAPE {r.mape * 100:.1f}%)"
+                  for r in df_dc.itertuples()]
+        ids = df_dc["dc_id"].tolist()
+        choice = st.selectbox(
+            "Pick a DC to drill into variance drivers",
+            options=range(len(labels)),
+            format_func=lambda i: labels[i],
+            key="acc_quick_pick",
+        )
+        if st.button("Open DC accuracy detail", use_container_width=True):
+            st.session_state["selected_dc"] = ids[choice]
+            st.session_state["view"] = "detail"
+            st.session_state["jump_to_accuracy"] = True
+            st.rerun()
 
 
 # =============================================================================
@@ -1095,6 +1394,247 @@ def category_or_sku(df, selected_category, sum_cols=(), wavg_cols=(), risk_col=N
 
 
 # =============================================================================
+# FORECAST ACCURACY + VARIANCE DRIVERS (per-DC, inside detail view)
+# =============================================================================
+def _render_dc_accuracy_section(dc_id, df_products, selected_category):
+    st.markdown("---")
+    expanded = bool(st.session_state.pop("jump_to_accuracy", False))
+    with st.expander("\U0001f4ca Forecast Accuracy", expanded=expanded):
+        try:
+            df_acc = load_dc_accuracy(dc_id)
+        except Exception as e:
+            st.error(f"Could not load accuracy data for {dc_id}: {e}")
+            return
+        if df_acc.empty:
+            st.info(
+                "No historical demand actuals for this DC yet. Re-run the "
+                "'Generate Synthetic Data' notebook with a non-zero "
+                "`planning.history_days` to populate the history window."
+            )
+            return
+
+        # KPI strip
+        total_actual = df_acc["actual_units"].sum()
+        mape = float(df_acc["abs_error_units"].sum() / max(total_actual, 1))
+        bias = float(df_acc["signed_error_units"].sum() / max(total_actual, 1))
+        fill_acc = float(
+            df_acc[["forecast_units", "actual_units"]].min(axis=1).sum()
+            / max(total_actual, 1)
+        )
+        per_sku = (
+            df_acc.groupby("sku_id", as_index=False)
+                  .agg(abs_e=("abs_error_units", "sum"),
+                       act=("actual_units", "sum"))
+        )
+        per_sku["sku_mape"] = per_sku["abs_e"] / per_sku["act"].clip(lower=1)
+        n_at_risk = int((per_sku["sku_mape"] > _ACC_RISK_THRESHOLD).sum())
+
+        k1, k2, k3, k4 = st.columns(4)
+        k1.metric("MAPE",               f"{mape * 100:.1f}%")
+        k2.metric("Bias %",             f"{bias * 100:+.1f}%")
+        k3.metric("Fill-rate accuracy", f"{fill_acc * 100:.1f}%")
+        k4.metric("At-risk SKUs",       f"{n_at_risk:,}",
+                  help=f"SKUs with MAPE > {_ACC_RISK_THRESHOLD * 100:.0f}%.")
+
+        # Rollup / drill via category_or_sku()
+        df_acc["product_category"] = df_acc["product_category"].fillna("Unknown")
+        df_acc["is_at_risk"] = df_acc["sku_id"].isin(
+            per_sku.loc[per_sku["sku_mape"] > _ACC_RISK_THRESHOLD, "sku_id"]
+        )
+        # Demand-weighted mape and bias_pct columns for the helper.
+        df_acc["mape"] = (df_acc["abs_error_units"] / df_acc["actual_units"].clip(lower=1))
+        df_acc["bias_pct"] = (df_acc["signed_error_units"] / df_acc["actual_units"].clip(lower=1))
+        df_view = category_or_sku(
+            df_acc,
+            selected_category,
+            sum_cols=("forecast_units", "actual_units", "abs_error_units"),
+            wavg_cols=[("mape", "actual_units"), ("bias_pct", "actual_units")],
+            risk_col="is_at_risk",
+        )
+
+        # Forecast vs Actual grouped bar
+        st.markdown("##### Forecast vs Actual")
+        fig_fa = go.Figure()
+        fig_fa.add_trace(go.Bar(
+            x=df_view["group_label"], y=df_view["forecast_units"],
+            name="Forecast", marker_color="#1f77b4",
+        ))
+        fig_fa.add_trace(go.Bar(
+            x=df_view["group_label"], y=df_view["actual_units"],
+            name="Actual", marker_color="#2ca02c",
+        ))
+        fig_fa.update_layout(
+            barmode="group",
+            height=320,
+            margin=dict(l=10, r=10, t=10, b=10),
+            xaxis=dict(title="Category" if selected_category is None else "SKU"),
+            yaxis=dict(title="Units"),
+            legend=dict(orientation="h", y=1.1),
+        )
+        st.plotly_chart(fig_fa, use_container_width=True)
+
+        # Bias % diverging bar
+        st.markdown("##### Bias % (positive = over-forecast)")
+        fig_bias = px.bar(
+            df_view.sort_values("bias_pct"),
+            x="bias_pct", y="group_label",
+            orientation="h",
+            color="bias_pct",
+            color_continuous_scale="RdBu_r",
+            color_continuous_midpoint=0,
+            labels={"bias_pct": "Bias", "group_label": ""},
+        )
+        fig_bias.update_layout(
+            height=max(220, 24 * len(df_view)),
+            margin=dict(l=10, r=10, t=10, b=10),
+            xaxis=dict(tickformat=".0%"),
+            coloraxis_showscale=False,
+        )
+        st.plotly_chart(fig_bias, use_container_width=True)
+
+        # SKU × week MAPE heatmap (only in drill mode where there are few SKUs)
+        if selected_category is not None:
+            st.markdown("##### Weekly MAPE heatmap (SKU × week)")
+            df_acc["forecast_date"] = pd.to_datetime(df_acc["forecast_date"])
+            df_acc["week"] = df_acc["forecast_date"].dt.to_period("W").dt.start_time
+            heat = (
+                df_acc.groupby(["sku_id", "week"])
+                      .agg(abs_e=("abs_error_units", "sum"),
+                           act=("actual_units", "sum"))
+                      .reset_index()
+            )
+            heat["mape"] = (heat["abs_e"] / heat["act"].clip(lower=1)) * 100
+            heat_p = heat.pivot(index="sku_id", columns="week", values="mape").fillna(0)
+            fig_heat = px.imshow(
+                heat_p,
+                aspect="auto",
+                color_continuous_scale="Reds",
+                labels=dict(x="Week", y="SKU", color="MAPE %"),
+            )
+            fig_heat.update_layout(height=max(220, 18 * len(heat_p)),
+                                   margin=dict(l=10, r=10, t=10, b=10))
+            st.plotly_chart(fig_heat, use_container_width=True)
+
+        # =====================================================================
+        # Variance drivers (Feature 2) — tabs (not expanders) because Streamlit
+        # forbids nesting expanders and the parent Forecast Accuracy block is
+        # already an expander.
+        # =====================================================================
+        st.markdown("---")
+        st.markdown("#### Variance drivers")
+
+        tab_demand, tab_inv, tab_tx = st.tabs(
+            ["Demand shifts", "Inventory drivers", "Transportation drivers"]
+        )
+
+        # --- D1: Demand shifts ---
+        with tab_demand:
+            df_acc["forecast_date"] = pd.to_datetime(df_acc["forecast_date"])
+            df_acc["week"] = df_acc["forecast_date"].dt.to_period("W").dt.start_time
+            wow = (
+                df_acc.groupby(["week", "product_category"])
+                      .agg(forecast=("forecast_units", "sum"),
+                           actual=("actual_units", "sum"))
+                      .reset_index()
+            )
+            wow["delta_pct"] = ((wow["actual"] - wow["forecast"])
+                                / wow["forecast"].clip(lower=1)) * 100
+            fig_wow = px.line(
+                wow, x="week", y="delta_pct", color="product_category",
+                labels={"delta_pct": "Actual − Forecast (%)", "week": ""},
+            )
+            fig_wow.add_hline(y=0, line_dash="dash", line_color="gray")
+            fig_wow.update_layout(height=280, margin=dict(l=10, r=10, t=10, b=10))
+            st.plotly_chart(fig_wow, use_container_width=True)
+
+            top_off = (
+                per_sku.merge(df_products[["sku_id", "product_category"]], on="sku_id", how="left")
+                       .sort_values("abs_e", ascending=False)
+                       .head(10)
+                       .rename(columns={"abs_e": "abs_error_units",
+                                        "act": "actual_units",
+                                        "sku_mape": "mape"})
+            )
+            top_off["mape"] = (top_off["mape"] * 100).round(1).astype(str) + "%"
+            st.markdown("**Top 10 SKUs by absolute forecast error**")
+            st.dataframe(
+                top_off[["sku_id", "product_category", "actual_units", "abs_error_units", "mape"]],
+                use_container_width=True, hide_index=True,
+            )
+
+        # --- D2: Inventory drivers ---
+        with tab_inv:
+            st.caption(
+                "At-risk SKUs from current `inventory_levels` (low days-of-supply). "
+                "If the optimization run below reports `storage_overflow > 0`, "
+                "storage capacity is the binding constraint."
+            )
+            inv_q = f"""
+            SELECT i.sku_id, p.product_category, i.on_hand_units, i.days_of_supply
+            FROM {SCHEMA}.inventory_levels i
+            JOIN {SCHEMA}.product_master p USING (sku_id)
+            WHERE i.dc_id = %(dc_id)s
+            ORDER BY i.days_of_supply ASC
+            LIMIT 15
+            """
+            df_inv = run_query(inv_q, {"dc_id": dc_id})
+            if df_inv.empty:
+                st.info("No inventory snapshot rows for this DC.")
+            else:
+                for c in ("on_hand_units", "days_of_supply"):
+                    df_inv[c] = pd.to_numeric(df_inv[c], errors="coerce").fillna(0)
+                st.markdown("**Bottom 15 SKUs by days-of-supply**")
+                st.dataframe(df_inv, use_container_width=True, hide_index=True)
+
+        # --- D3: Transportation drivers ---
+        with tab_tx:
+            try:
+                df_tx = load_transport_actuals(dc_id)
+            except Exception as e:
+                st.error(f"Could not load transport actuals: {e}")
+                df_tx = pd.DataFrame()
+            if df_tx.empty:
+                st.info(
+                    "No historical transport actuals for this DC. Re-run the "
+                    "data generator to populate inbound/outbound actuals."
+                )
+            else:
+                inb = df_tx[df_tx["direction"] == "inbound"]
+                out = df_tx[df_tx["direction"] == "outbound"]
+                k1, k2, k3, k4 = st.columns(4)
+                k1.metric("On-time inbound",
+                          f"{(inb['on_time'].mean() * 100):.0f}%" if not inb.empty else "—")
+                k2.metric("On-time outbound",
+                          f"{(out['on_time'].mean() * 100):.0f}%" if not out.empty else "—")
+                k3.metric("Avg inbound delay",
+                          f"{inb.loc[inb['delay_days'] > 0, 'delay_days'].mean():.1f} d"
+                          if not inb.empty and (inb['delay_days'] > 0).any() else "0 d")
+                k4.metric("Avg outbound delay",
+                          f"{out.loc[out['delay_days'] > 0, 'delay_days'].mean():.1f} d"
+                          if not out.empty and (out['delay_days'] > 0).any() else "0 d")
+
+                by_partner = (
+                    df_tx.groupby(["direction", "partner_id"], as_index=False)
+                         .agg(shipments=("partner_id", "size"),
+                              on_time_pct=("on_time", "mean"))
+                )
+                by_partner["on_time_pct"] = by_partner["on_time_pct"] * 100
+                fig_partner = px.bar(
+                    by_partner.sort_values(["direction", "on_time_pct"]),
+                    x="on_time_pct", y="partner_id",
+                    color="direction", orientation="h", barmode="group",
+                    labels={"on_time_pct": "On-time %", "partner_id": ""},
+                    color_discrete_map={"inbound": "#1f77b4", "outbound": "#ff7f0e"},
+                )
+                fig_partner.add_vline(x=90, line_dash="dash", line_color="gray")
+                fig_partner.update_layout(
+                    height=max(260, 22 * len(by_partner)),
+                    margin=dict(l=10, r=10, t=10, b=10),
+                )
+                st.plotly_chart(fig_partner, use_container_width=True)
+
+
+# =============================================================================
 # DETAIL VIEW
 # =============================================================================
 def render_detail(dc_id, df_summary):
@@ -1429,6 +1969,9 @@ def render_detail(dc_id, df_summary):
             ]
         cov_display = cov_display.sort_values("Coverage Ratio")
         st.dataframe(cov_display, use_container_width=True, hide_index=True)
+
+    # --- Forecast Accuracy + Variance Drivers ---
+    _render_dc_accuracy_section(dc_id, df_products, selected_category)
 
     # --- Outbound Throughput (WDC → Local Couriers) ---
     if df_outbound is not None and not df_outbound.empty:
@@ -1925,7 +2468,10 @@ except Exception as e:
 df_ndc_summary = load_ndc_summary()
 ndc_ids = set(df_ndc_summary["dc_id"]) if not df_ndc_summary.empty else set()
 
-if st.session_state["view"] == "map" or not st.session_state.get("selected_dc"):
+_view = st.session_state["view"]
+if _view == "accuracy":
+    render_accuracy_network(df_summary)
+elif _view == "map" or not st.session_state.get("selected_dc"):
     render_map(df_summary, df_ndc_summary if not df_ndc_summary.empty else None)
 else:
     selected = st.session_state["selected_dc"]

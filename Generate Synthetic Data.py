@@ -182,8 +182,20 @@ start_date = _to_date(plan_cfg["start_date"])
 n_periods = plan_cfg["n_periods"]
 planning_dates = [start_date + timedelta(days=d) for d in range(n_periods)]
 
+# --- History horizon (powers the Forecast Accuracy dashboard) ---
+# history_days of actuals ending the day before start_date. demand_forecast,
+# inbound_plan, and outbound_plan all extend back over this window with their
+# actual_* columns populated; future rows leave actuals NULL.
+history_days = plan_cfg.get("history_days", 0)
+history_dates = [start_date - timedelta(days=h)
+                 for h in range(history_days, 0, -1)]
+all_dates = history_dates + planning_dates
+
 print(f"DCs:      {n_dcs} ({dc_ids[0]} … {dc_ids[-1]})")
 print(f"SKUs:     {n_skus} ({sku_ids[0]} … {sku_ids[-1]})")
+print(f"History:  {history_days} days "
+      f"({history_dates[0] if history_dates else '—'} → "
+      f"{history_dates[-1] if history_dates else '—'})")
 print(f"Periods:  {n_periods} days ({planning_dates[0]} → {planning_dates[-1]})")
 
 # COMMAND ----------
@@ -313,16 +325,31 @@ print(f"  ✓ dc_capacity: {len(capacity_rows)} rows")
 
 # DBTITLE 1,demand_forecast
 demand_cfg = SD["demand"]
+acc_cfg = demand_cfg.get("accuracy", {})
+mape_rng = acc_cfg.get("mape_per_sku_rng", {"min": 0.05, "max": 0.30})
+bias_rng = acc_cfg.get("bias_pct_rng",     {"min": -0.12, "max": 0.12})
+today_dt = date.today()
+
 demand_rows = []
 # Each (DC, SKU) gets its own baseline demand level; daily values vary around it.
+# Historical rows (forecast_date < today) carry actual_units derived from the
+# forecast via per-SKU bias + N(0, mape) noise. Future rows leave actual_units
+# NULL — the Forecast Accuracy dashboard filters on `actual_units IS NOT NULL`.
 for dc in dc_ids:
     for sku in sku_ids:
         prod = products_by_sku[sku]
         base = int(rint(demand_cfg["base_units_per_sku"]))
-        for d in planning_dates:
+        sku_mape = float(runif(mape_rng))
+        sku_bias = float(runif(bias_rng))
+        for d in all_dates:
             qty = int(base * float(runif(demand_cfg["daily_variance"])))
             cases = qty // prod["units_per_case"]
             pallets = cases / prod["cases_per_pallet"]
+            if d < today_dt:
+                noise = float(np.clip(np.random.normal(0.0, sku_mape), -3 * sku_mape, 3 * sku_mape))
+                actual = max(0, int(round(qty * (1.0 + sku_bias) * (1.0 + noise))))
+            else:
+                actual = None
             demand_rows.append({
                 "forecast_id": str(uuid.uuid4()),
                 "dc_id": dc,
@@ -330,6 +357,7 @@ for dc in dc_ids:
                 "forecast_date": d,
                 "forecast_period": "DAILY",
                 "demand_units": qty,
+                "actual_units": actual,
                 "demand_cases": cases,
                 "demand_pallets": round(pallets, 2),
                 "demand_cube_ft3": round(qty * prod["unit_cube_ft3"], 2),
@@ -339,13 +367,42 @@ for dc in dc_ids:
                 "created_at": NOW,
             })
 
+# Explicit schema so actual_units stays nullable (an all-NULL future-only run
+# would otherwise infer NullType and break the column).
+demand_schema = StructType([
+    StructField("forecast_id",       StringType(),  False),
+    StructField("dc_id",             StringType(),  False),
+    StructField("sku_id",            StringType(),  False),
+    StructField("forecast_date",     DateType(),    False),
+    StructField("forecast_period",   StringType(),  True),
+    StructField("demand_units",      IntegerType(), True),
+    StructField("actual_units",      IntegerType(), True),
+    StructField("demand_cases",      IntegerType(), True),
+    StructField("demand_pallets",    DoubleType(),  True),
+    StructField("demand_cube_ft3",   DoubleType(),  True),
+    StructField("demand_weight_lbs", DoubleType(),  True),
+    StructField("confidence_level",  DoubleType(),  True),
+    StructField("forecast_source",   StringType(),  True),
+    StructField("created_at",        TimestampType(), True),
+])
+_demand_tuples = [(
+    r["forecast_id"], r["dc_id"], r["sku_id"], r["forecast_date"],
+    r["forecast_period"], r["demand_units"], r["actual_units"],
+    r["demand_cases"], r["demand_pallets"], r["demand_cube_ft3"],
+    r["demand_weight_lbs"], float(r["confidence_level"]),
+    r["forecast_source"], r["created_at"],
+) for r in demand_rows]
+
 spark.sql(f"DROP TABLE IF EXISTS {SCHEMA}.demand_forecast")
-spark.createDataFrame(pd.DataFrame(demand_rows)).write.saveAsTable(f"{SCHEMA}.demand_forecast")
+spark.createDataFrame(_demand_tuples, schema=demand_schema) \
+     .write.saveAsTable(f"{SCHEMA}.demand_forecast")
 
 add_table_metadata(
     "demand_forecast",
     "Daily demand forecast per (DC, SKU). Drives the LP fulfillment and "
-    "the inventory / inbound sizing logic.",
+    "the inventory / inbound sizing logic. For dates before today, "
+    "actual_units holds the realized demand used by the Forecast Accuracy "
+    "dashboard; future rows leave actual_units NULL.",
     {
         "forecast_id": "Surrogate UUID primary key for this forecast row.",
         "dc_id": "Distribution center receiving the demand; FK to distribution_centers.",
@@ -353,6 +410,7 @@ add_table_metadata(
         "forecast_date": "Day this forecast applies to.",
         "forecast_period": "Forecast bucket size; currently always DAILY.",
         "demand_units": "Forecast demand in eaches.",
+        "actual_units": "Realized demand in eaches; populated for forecast_date < today, NULL for the planning horizon.",
         "demand_cases": "Forecast demand in cases (demand_units / units_per_case).",
         "demand_pallets": "Forecast demand in pallets.",
         "demand_cube_ft3": "Forecast demand volume in cubic feet.",
@@ -371,7 +429,9 @@ add_constraints(
     ],
 )
 
-print(f"  ✓ demand_forecast: {len(demand_rows)} rows")
+_n_actual = sum(1 for r in demand_rows if r["actual_units"] is not None)
+print(f"  ✓ demand_forecast: {len(demand_rows)} rows "
+      f"({_n_actual} historical with actuals, {len(demand_rows) - _n_actual} future)")
 
 # COMMAND ----------
 
@@ -384,8 +444,12 @@ print(f"  ✓ demand_forecast: {len(demand_rows)} rows")
 inv_cfg = SD["inventory"]
 snapshot_date = _to_date(inv_cfg["snapshot_date"])
 
+# Sum only forward-looking demand — inventory and inbound sizing target the
+# planning horizon (n_periods days), not the history window.
 demand_total_by_key = {}
 for r in demand_rows:
+    if r["forecast_date"] < start_date:
+        continue
     k = (r["dc_id"], r["sku_id"])
     demand_total_by_key[k] = demand_total_by_key.get(k, 0) + r["demand_units"]
 
@@ -602,6 +666,7 @@ inbound_schema = StructType([
     StructField("scheduled_date", DateType(), False),
     StructField("actual_date", DateType(), True),
     StructField("inbound_units", IntegerType(), True),
+    StructField("actual_units", IntegerType(), True),
     StructField("inbound_cases", IntegerType(), True),
     StructField("inbound_pallets", DoubleType(), True),
     StructField("inbound_cube_ft3", DoubleType(), True),
@@ -619,51 +684,84 @@ inb_cfg = SD["inbound"]
 coverage_rng = inb_cfg.get("coverage_ratio", {"min": 0.95, "max": 1.05})
 n_receipts_rng = inb_cfg.get("n_receipts_per_horizon", {"min": 4, "max": 12})
 
-inbound_rows = []
-n_dates = len(planning_dates)
-for dc in dc_ids:
-    for sku in sku_ids:
-        prod = products_by_sku[sku]
-        units_per_pallet = prod["units_per_case"] * prod["cases_per_pallet"]
-        total_demand_units = demand_total_by_key.get((dc, sku), 0)
-        coverage = float(runif(coverage_rng))
-        target_pallets = int(round(total_demand_units * coverage / units_per_pallet))
-        if target_pallets <= 0:
-            continue
-        n_receipts = int(rint(n_receipts_rng))
-        n_receipts = max(1, min(n_receipts, target_pallets, n_dates))
-        # Evenly-spaced receipt day indices: e.g. 6 receipts in 30 days ->
-        # days 2, 7, 12, 17, 22, 27.
-        receipt_day_idxs = [
-            int((i + 0.5) * n_dates / n_receipts) for i in range(n_receipts)
-        ]
-        base = target_pallets // n_receipts
-        remainder = target_pallets - base * n_receipts
-        pallets_per_receipt = [base + (1 if i < remainder else 0) for i in range(n_receipts)]
-        np.random.shuffle(pallets_per_receipt)
-        for day_idx, pallets in zip(receipt_day_idxs, pallets_per_receipt):
-            if pallets < 1:
+# Historical actuals (Forecast Accuracy dashboard) — receipts in the
+# `history_dates` window carry an actual_date (potentially delayed) and an
+# actual_units that varies around the planned quantity.
+inb_act_cfg = inb_cfg.get("actuals", {})
+inb_on_time = float(inb_act_cfg.get("on_time_rate", 0.85))
+inb_delay_rng = inb_act_cfg.get("delay_days_rng", {"min": 1, "max": 5})
+inb_fill_rng = inb_act_cfg.get("fill_rate_rng", {"min": 0.95, "max": 1.05})
+
+
+def _build_inbound_rows(dates_window, populate_actuals):
+    """Build inbound rows for the given date window. When populate_actuals is
+    True, each receipt gets an actual_date / actual_units / RECEIVED status."""
+    rows = []
+    n_window = len(dates_window)
+    if n_window == 0:
+        return rows
+    horizon_ratio = n_window / max(len(planning_dates), 1)
+    for dc in dc_ids:
+        for sku in sku_ids:
+            prod = products_by_sku[sku]
+            units_per_pallet = prod["units_per_case"] * prod["cases_per_pallet"]
+            # Scale demand to the window length so history receipts are proportional.
+            total_demand_units = demand_total_by_key.get((dc, sku), 0) * horizon_ratio
+            coverage = float(runif(coverage_rng))
+            target_pallets = int(round(total_demand_units * coverage / units_per_pallet))
+            if target_pallets <= 0:
                 continue
-            d = planning_dates[day_idx]
-            units = pallets * units_per_pallet
-            cases = units // prod["units_per_case"]
-            inbound_rows.append((
-                str(uuid.uuid4()),
-                dc,
-                sku,
-                f"SUP-{int(rint(inb_cfg['supplier_id']))}",
-                f"PO-{np.random.randint(10000, 100000)}",
-                d,
-                None,
-                int(units),
-                int(cases),
-                float(pallets),
-                round(units * prod["unit_cube_ft3"], 2),
-                round(units * prod["unit_weight_lbs"], 2),
-                "PLANNED",
-                max(1, pallets // 20),
-                NOW,
-            ))
+            n_receipts = max(1, int(round(int(rint(n_receipts_rng)) * horizon_ratio)))
+            n_receipts = min(n_receipts, target_pallets, n_window)
+            receipt_day_idxs = [
+                int((i + 0.5) * n_window / n_receipts) for i in range(n_receipts)
+            ]
+            base = target_pallets // n_receipts
+            remainder = target_pallets - base * n_receipts
+            pallets_per_receipt = [base + (1 if i < remainder else 0) for i in range(n_receipts)]
+            np.random.shuffle(pallets_per_receipt)
+            for day_idx, pallets in zip(receipt_day_idxs, pallets_per_receipt):
+                if pallets < 1:
+                    continue
+                d = dates_window[day_idx]
+                units = pallets * units_per_pallet
+                cases = units // prod["units_per_case"]
+                if populate_actuals:
+                    if np.random.random() < inb_on_time:
+                        actual_d = d
+                    else:
+                        actual_d = d + timedelta(days=int(rint(inb_delay_rng)))
+                    actual_u = max(0, int(round(units * float(runif(inb_fill_rng)))))
+                    status = "RECEIVED"
+                else:
+                    actual_d = None
+                    actual_u = None
+                    status = "PLANNED"
+                rows.append((
+                    str(uuid.uuid4()),
+                    dc,
+                    sku,
+                    f"SUP-{int(rint(inb_cfg['supplier_id']))}",
+                    f"PO-{np.random.randint(10000, 100000)}",
+                    d,
+                    actual_d,
+                    int(units),
+                    actual_u,
+                    int(cases),
+                    float(pallets),
+                    round(units * prod["unit_cube_ft3"], 2),
+                    round(units * prod["unit_weight_lbs"], 2),
+                    status,
+                    max(1, pallets // 20),
+                    NOW,
+                ))
+    return rows
+
+
+inbound_rows = (
+    _build_inbound_rows(history_dates, populate_actuals=True)
+    + _build_inbound_rows(planning_dates, populate_actuals=False)
+)
 
 spark.sql(f"DROP TABLE IF EXISTS {SCHEMA}.inbound_plan")
 spark.createDataFrame(inbound_rows, schema=inbound_schema) \
@@ -671,8 +769,9 @@ spark.createDataFrame(inbound_rows, schema=inbound_schema) \
 
 add_table_metadata(
     "inbound_plan",
-    "Planned inbound receipts at each WDC. Demand-aware sizing keeps the "
-    "horizon's receipts ≈ horizon demand so storage stays roughly stable.",
+    "Inbound receipts at each WDC over both the history window (with actuals "
+    "populated) and the forward planning horizon. Demand-aware sizing keeps "
+    "receipts ≈ demand for each window.",
     {
         "inbound_id": "Surrogate UUID primary key for this receipt.",
         "dc_id": "Destination distribution center; FK to distribution_centers.",
@@ -680,13 +779,14 @@ add_table_metadata(
         "supplier_id": "Originating supplier identifier (synthetic SUP-NNN).",
         "po_number": "Purchase order number (synthetic PO-NNNNN).",
         "scheduled_date": "Planned receipt date.",
-        "actual_date": "Actual receipt date; null in the plan, populated post-receipt.",
-        "inbound_units": "Receipt size in eaches.",
+        "actual_date": "Actual receipt date; populated for historical receipts (potentially delayed vs. scheduled_date), NULL for forward plan.",
+        "inbound_units": "Planned receipt size in eaches.",
+        "actual_units": "Realized receipt size in eaches; populated for historical receipts only.",
         "inbound_cases": "Receipt size in cases.",
         "inbound_pallets": "Receipt size in pallets.",
         "inbound_cube_ft3": "Receipt volume in cubic feet.",
         "inbound_weight_lbs": "Receipt weight in pounds.",
-        "receipt_status": "Receipt lifecycle status (PLANNED, RECEIVED, ...).",
+        "receipt_status": "Receipt lifecycle status (PLANNED for forward rows, RECEIVED for historical).",
         "trailer_count": "Trailers needed for this receipt.",
         "created_at": "Row creation timestamp.",
     },
@@ -714,6 +814,7 @@ outbound_schema = StructType([
     StructField("scheduled_ship_date", DateType(), False),
     StructField("actual_ship_date", DateType(), True),
     StructField("outbound_units", IntegerType(), True),
+    StructField("actual_units", IntegerType(), True),
     StructField("outbound_cases", IntegerType(), True),
     StructField("outbound_pallets", DoubleType(), True),
     StructField("outbound_cube_ft3", DoubleType(), True),
@@ -726,15 +827,32 @@ outbound_schema = StructType([
 ])
 
 out_cfg = SD["outbound"]
+out_act_cfg = out_cfg.get("actuals", {})
+out_on_time = float(out_act_cfg.get("on_time_rate", 0.90))
+out_delay_rng = out_act_cfg.get("delay_days_rng", {"min": 1, "max": 3})
+out_fill_rng = out_act_cfg.get("fill_rate_rng", {"min": 0.95, "max": 1.03})
+
 outbound_rows = []
 for dc in dc_ids:
     for sku in sku_ids:
         prod = products_by_sku[sku]
-        for d in planning_dates:
+        for d in all_dates:
             if np.random.random() < out_cfg["probability_per_sku_day"]:
                 units = int(rint(out_cfg["units"]))
                 cases = units // prod["units_per_case"]
                 pallets = cases / prod["cases_per_pallet"]
+                is_history = d < start_date
+                if is_history:
+                    if np.random.random() < out_on_time:
+                        actual_d = d
+                    else:
+                        actual_d = d + timedelta(days=int(rint(out_delay_rng)))
+                    actual_u = max(0, int(round(units * float(runif(out_fill_rng)))))
+                    status = "SHIPPED"
+                else:
+                    actual_d = None
+                    actual_u = None
+                    status = "PLANNED"
                 outbound_rows.append((
                     str(uuid.uuid4()),
                     dc,
@@ -742,13 +860,14 @@ for dc in dc_ids:
                     f"CUST-{np.random.randint(1000, 10000)}",
                     f"SO-{np.random.randint(100000, 1000000)}",
                     d,
-                    None,
+                    actual_d,
                     int(units),
+                    actual_u,
                     int(cases),
                     round(pallets, 2),
                     round(units * prod["unit_cube_ft3"], 2),
                     round(units * prod["unit_weight_lbs"], 2),
-                    "PLANNED",
+                    status,
                     str(rchoice(out_cfg["priorities"])),
                     str(rchoice(out_cfg["carriers"])),
                     1,
@@ -761,8 +880,9 @@ spark.createDataFrame(outbound_rows, schema=outbound_schema) \
 
 add_table_metadata(
     "outbound_plan",
-    "Planned outbound shipments leaving each WDC. Carries priority and "
-    "carrier so the LP can reason about expediting / detention.",
+    "Outbound shipments leaving each WDC, spanning the history window (with "
+    "actuals populated) and the forward planning horizon. Carries priority "
+    "and carrier so the LP can reason about expediting / detention.",
     {
         "outbound_id": "Surrogate UUID primary key for this shipment.",
         "dc_id": "Origin distribution center; FK to distribution_centers.",
@@ -770,13 +890,14 @@ add_table_metadata(
         "customer_id": "Destination customer identifier (synthetic CUS-NNN).",
         "order_number": "Customer order number (synthetic ORD-NNNNN).",
         "scheduled_ship_date": "Planned ship date.",
-        "actual_ship_date": "Actual ship date; null in the plan, populated post-ship.",
-        "outbound_units": "Shipment size in eaches.",
+        "actual_ship_date": "Actual ship date; populated for historical shipments (potentially delayed vs. scheduled_ship_date), NULL for forward plan.",
+        "outbound_units": "Planned shipment size in eaches.",
+        "actual_units": "Realized shipment size in eaches; populated for historical shipments only.",
         "outbound_cases": "Shipment size in cases.",
         "outbound_pallets": "Shipment size in pallets.",
         "outbound_cube_ft3": "Shipment volume in cubic feet.",
         "outbound_weight_lbs": "Shipment weight in pounds.",
-        "ship_status": "Shipment lifecycle status (PLANNED, SHIPPED, ...).",
+        "ship_status": "Shipment lifecycle status (PLANNED for forward rows, SHIPPED for historical).",
         "order_priority": "Order priority (CRITICAL, HIGH, MEDIUM, LOW).",
         "carrier_id": "Carrier handling the shipment.",
         "trailer_count": "Trailers needed for this shipment.",

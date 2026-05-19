@@ -156,6 +156,20 @@ FACILITY_FILTER = cfg["synthetic_data"]["distribution_centers"]["facility_type"]
 if not df_dc_meta.empty:
     df_dc_meta = df_dc_meta[df_dc_meta["facility_type"] == FACILITY_FILTER].copy()
 
+# Restrict demand to the forward planning horizon — historical rows (those with
+# actual_units populated) drive the Forecast Accuracy dashboard, not the LP.
+if not df_demand.empty:
+    planning_start = pd.to_datetime(cfg["synthetic_data"]["planning"]["start_date"]).date()
+    df_demand = df_demand[df_demand["forecast_date"] >= planning_start].copy()
+    print(f"  → filtered demand_forecast to forward horizon: {len(df_demand)} rows")
+
+# Inbound/outbound history rows have actual_date / actual_ship_date populated;
+# the LP only plans the forward horizon, so drop those.
+if not df_inbound.empty and "actual_date" in df_inbound.columns:
+    df_inbound = df_inbound[df_inbound["actual_date"].isna()].copy()
+if not df_outbound.empty and "actual_ship_date" in df_outbound.columns:
+    df_outbound = df_outbound[df_outbound["actual_ship_date"].isna()].copy()
+
 required = {
     "product_master": df_products,
     "demand_forecast": df_demand,
@@ -565,3 +579,205 @@ if optimal:
         print("\n✓ No DC exceeded capacity — all operations within limits.")
 else:
     print("⚠️  No optimal results to summarize.")
+
+# COMMAND ----------
+
+# DBTITLE 1,Forecast vs Demand Accuracy (history-window analytics)
+# MAGIC %md
+# MAGIC Computes forecast-vs-actual metrics from the history window of
+# MAGIC `demand_forecast` (rows where `actual_units IS NOT NULL`) and writes
+# MAGIC them to two Delta tables for downstream consumption (Lakeview, Genie,
+# MAGIC the Streamlit app):
+# MAGIC
+# MAGIC - `forecast_accuracy_network` — one row per DC plus a `NETWORK` rollup row.
+# MAGIC - `forecast_accuracy_daily`   — one row per `(dc_id, forecast_date)` for trend charts.
+# MAGIC
+# MAGIC Formulas mirror `app.py:load_accuracy_network()` so the app and these
+# MAGIC tables agree. Source data is untouched — these are pure derived tables.
+
+# COMMAND ----------
+
+# DBTITLE 1,forecast_accuracy_network
+# At-risk threshold matches app.py:_ACC_RISK_THRESHOLD. Keep them in lockstep.
+ACC_RISK_THRESHOLD = 0.30
+
+network_sql = f"""
+WITH hist AS (
+  SELECT
+    f.dc_id,
+    f.sku_id,
+    f.forecast_date,
+    f.demand_units,
+    f.actual_units,
+    ABS(f.demand_units - f.actual_units)           AS abs_err,
+    (f.demand_units - f.actual_units)              AS signed_err,
+    LEAST(f.demand_units, f.actual_units)          AS fill_units
+  FROM {SCHEMA}.demand_forecast f
+  WHERE f.actual_units IS NOT NULL
+),
+per_sku AS (
+  SELECT
+    dc_id,
+    sku_id,
+    SUM(abs_err) / NULLIF(SUM(actual_units), 0) AS sku_mape
+  FROM hist
+  GROUP BY dc_id, sku_id
+),
+per_dc AS (
+  SELECT
+    d.dc_id,
+    d.facility_name,
+    SUM(h.abs_err)    / NULLIF(SUM(h.actual_units), 0) AS mape,
+    SUM(h.signed_err) / NULLIF(SUM(h.actual_units), 0) AS bias_pct,
+    SUM(h.fill_units) / NULLIF(SUM(h.actual_units), 0) AS fill_rate_accuracy,
+    SUM(h.actual_units)        AS total_actual_units,
+    SUM(h.demand_units)        AS total_forecast_units,
+    COUNT(DISTINCT h.sku_id)   AS n_skus,
+    COUNT(DISTINCT CASE WHEN s.sku_mape > {ACC_RISK_THRESHOLD} THEN s.sku_id END)
+                               AS n_at_risk_skus,
+    COUNT(DISTINCT h.forecast_date) AS history_days
+  FROM {SCHEMA}.distribution_centers d
+  JOIN hist h        USING (dc_id)
+  LEFT JOIN per_sku s USING (dc_id, sku_id)
+  WHERE d.facility_type = '{FACILITY_FILTER}'
+  GROUP BY d.dc_id, d.facility_name
+),
+net AS (
+  SELECT
+    'NETWORK' AS dc_id,
+    'All Wholesale DCs' AS facility_name,
+    SUM(h.abs_err)    / NULLIF(SUM(h.actual_units), 0) AS mape,
+    SUM(h.signed_err) / NULLIF(SUM(h.actual_units), 0) AS bias_pct,
+    SUM(h.fill_units) / NULLIF(SUM(h.actual_units), 0) AS fill_rate_accuracy,
+    SUM(h.actual_units)        AS total_actual_units,
+    SUM(h.demand_units)        AS total_forecast_units,
+    COUNT(DISTINCT h.sku_id)   AS n_skus,
+    COUNT(DISTINCT CASE WHEN s.sku_mape > {ACC_RISK_THRESHOLD} THEN s.sku_id END)
+                               AS n_at_risk_skus,
+    COUNT(DISTINCT h.forecast_date) AS history_days
+  FROM hist h
+  LEFT JOIN per_sku s USING (dc_id, sku_id)
+)
+SELECT *, current_timestamp() AS computed_at FROM per_dc
+UNION ALL
+SELECT *, current_timestamp() AS computed_at FROM net
+"""
+
+spark.sql(f"DROP TABLE IF EXISTS {SCHEMA}.forecast_accuracy_network")
+spark.sql(network_sql).write.saveAsTable(f"{SCHEMA}.forecast_accuracy_network")
+
+# Documentation + informational PK so the table is self-describing in
+# Catalog Explorer / Genie, matching the rest of the schema.
+spark.sql(f"""
+COMMENT ON TABLE {SCHEMA}.forecast_accuracy_network IS
+  'Forecast-vs-actual accuracy aggregated over the history window of demand_forecast. One row per Wholesale DC plus a NETWORK rollup row. Refreshed each time the LP notebook runs.'
+""")
+for col, comment in {
+    "dc_id":                "Distribution center id, or the literal NETWORK for the network rollup row.",
+    "facility_name":        "DC facility name; 'All Wholesale DCs' for the network row.",
+    "mape":                 "Weighted mean absolute percent error = SUM(|forecast - actual|) / SUM(actual).",
+    "bias_pct":             "Weighted bias = SUM(forecast - actual) / SUM(actual). Positive = over-forecast.",
+    "fill_rate_accuracy":   "SUM(min(forecast, actual)) / SUM(actual). Caps at 1.0.",
+    "total_actual_units":   "Total actual demand over the history window.",
+    "total_forecast_units": "Total forecasted demand over the history window.",
+    "n_skus":               "Distinct SKUs observed at this DC.",
+    "n_at_risk_skus":       f"Distinct SKUs with per-SKU MAPE above {ACC_RISK_THRESHOLD} (the same threshold the app uses).",
+    "history_days":         "Distinct forecast_date values in the history window.",
+    "computed_at":          "Snapshot timestamp when this row was written.",
+}.items():
+    spark.sql(f"""
+        COMMENT ON COLUMN {SCHEMA}.forecast_accuracy_network.{col}
+        IS '{comment.replace("'", "''")}'
+    """)
+
+spark.sql(f"ALTER TABLE {SCHEMA}.forecast_accuracy_network ALTER COLUMN dc_id SET NOT NULL")
+spark.sql(f"""
+ALTER TABLE {SCHEMA}.forecast_accuracy_network
+ADD CONSTRAINT pk_forecast_accuracy_network PRIMARY KEY (dc_id) RELY
+""")
+
+print(f"  ✓ forecast_accuracy_network: "
+      f"{spark.table(f'{SCHEMA}.forecast_accuracy_network').count()} rows")
+
+# COMMAND ----------
+
+# DBTITLE 1,forecast_accuracy_daily
+daily_sql = f"""
+SELECT
+  dc_id,
+  forecast_date,
+  SUM(ABS(demand_units - actual_units))   / NULLIF(SUM(actual_units), 0) AS mape,
+  SUM(demand_units - actual_units)        / NULLIF(SUM(actual_units), 0) AS bias_pct,
+  SUM(actual_units)   AS actual_units,
+  SUM(demand_units)   AS forecast_units,
+  current_timestamp() AS computed_at
+FROM {SCHEMA}.demand_forecast
+WHERE actual_units IS NOT NULL
+GROUP BY dc_id, forecast_date
+"""
+
+spark.sql(f"DROP TABLE IF EXISTS {SCHEMA}.forecast_accuracy_daily")
+spark.sql(daily_sql).write.saveAsTable(f"{SCHEMA}.forecast_accuracy_daily")
+
+spark.sql(f"""
+COMMENT ON TABLE {SCHEMA}.forecast_accuracy_daily IS
+  'Daily forecast-vs-actual rollup per DC across the history window of demand_forecast. Powers the MAPE trend chart in the Streamlit app and any time-series dashboards.'
+""")
+for col, comment in {
+    "dc_id":          "Distribution center id.",
+    "forecast_date":  "Calendar day in the history window.",
+    "mape":           "Daily weighted MAPE for this DC.",
+    "bias_pct":       "Daily weighted bias % (positive = over-forecast).",
+    "actual_units":   "Sum of actual demand for this DC on this day.",
+    "forecast_units": "Sum of forecasted demand for this DC on this day.",
+    "computed_at":    "Snapshot timestamp when this row was written.",
+}.items():
+    spark.sql(f"""
+        COMMENT ON COLUMN {SCHEMA}.forecast_accuracy_daily.{col}
+        IS '{comment.replace("'", "''")}'
+    """)
+
+spark.sql(f"ALTER TABLE {SCHEMA}.forecast_accuracy_daily ALTER COLUMN dc_id SET NOT NULL")
+spark.sql(f"ALTER TABLE {SCHEMA}.forecast_accuracy_daily ALTER COLUMN forecast_date SET NOT NULL")
+spark.sql(f"""
+ALTER TABLE {SCHEMA}.forecast_accuracy_daily
+ADD CONSTRAINT pk_forecast_accuracy_daily PRIMARY KEY (dc_id, forecast_date) RELY
+""")
+
+print(f"  ✓ forecast_accuracy_daily: "
+      f"{spark.table(f'{SCHEMA}.forecast_accuracy_daily').count()} rows")
+
+# COMMAND ----------
+
+# DBTITLE 1,Display accuracy summary
+df_acc_net = (
+    spark.table(f"{SCHEMA}.forecast_accuracy_network")
+         .orderBy("mape", ascending=False)
+         .toPandas()
+)
+display(df_acc_net)
+
+net_row = df_acc_net[df_acc_net["dc_id"] == "NETWORK"].iloc[0]
+print("=" * 80)
+print("  FORECAST ACCURACY — NETWORK")
+print("=" * 80)
+print(f"  MAPE:               {net_row['mape'] * 100:>6.1f}%")
+print(f"  Bias %:             {net_row['bias_pct'] * 100:>+6.1f}%  "
+      f"({'over-forecasting' if net_row['bias_pct'] > 0 else 'under-forecasting'})")
+print(f"  Fill-rate accuracy: {net_row['fill_rate_accuracy'] * 100:>6.1f}%")
+print(f"  History days:       {int(net_row['history_days'])}")
+print(f"  At-risk SKUs:       {int(net_row['n_at_risk_skus'])} "
+      f"(MAPE > {ACC_RISK_THRESHOLD * 100:.0f}%)")
+print("=" * 80)
+
+at_risk_dcs = df_acc_net[
+    (df_acc_net["dc_id"] != "NETWORK") & (df_acc_net["mape"] > ACC_RISK_THRESHOLD)
+].sort_values("mape", ascending=False)
+if not at_risk_dcs.empty:
+    print(f"\n⚠️  DCs with MAPE above {ACC_RISK_THRESHOLD * 100:.0f}%:")
+    for _, row in at_risk_dcs.iterrows():
+        print(f"    {row['dc_id']} ({row['facility_name']}): "
+              f"MAPE {row['mape'] * 100:.1f}%, bias {row['bias_pct'] * 100:+.1f}% "
+              f"→ investigate variance drivers in the Streamlit app")
+else:
+    print(f"\n✓ All DCs within the {ACC_RISK_THRESHOLD * 100:.0f}% MAPE threshold.")
