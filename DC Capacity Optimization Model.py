@@ -113,8 +113,9 @@ PENALTIES = OPT["penalties"]
 FALLBACKS = OPT["fallback_capacities"]
 
 print(f"Loaded config — schema={SCHEMA}")
-print(f"  Penalty (storage/throughput/outbound/inbound): "
-      f"${PENALTIES['storage']}/cuft, ${PENALTIES['throughput']}/unit, "
+print(f"  Penalty (amb-storage/cold-storage/throughput/outbound/inbound): "
+      f"${PENALTIES['storage_ambient']}/cuft, ${PENALTIES['storage_cold']}/cuft, "
+      f"${PENALTIES['throughput']}/unit, "
       f"${PENALTIES['outbound']}/pallet, ${PENALTIES['inbound']}/pallet")
 
 # COMMAND ----------
@@ -248,13 +249,14 @@ def optimize_dc(dc_id, cfg, *,
     periods = sorted(dem["forecast_date"].unique())
 
     # ---- SKU-level params from product_master (shared across DCs) ----
-    revenue, holding_cost, cube, units_per_pallet = {}, {}, {}, {}
+    revenue, holding_cost, cube, units_per_pallet, storage_type = {}, {}, {}, {}, {}
     for _, row in df_products.iterrows():
         s = row["sku_id"]
         revenue[s] = row["revenue_per_unit"]
         holding_cost[s] = row["holding_cost_per_unit_per_day"]
         cube[s] = row["unit_cube_ft3"]
         units_per_pallet[s] = row["units_per_case"] * row["cases_per_pallet"]
+        storage_type[s] = row.get("storage_type", "AMBIENT")
 
     # ---- Labor cost params (per-DC override, else config default) ----
     regular_labor_cost = OPT["default_regular_labor_cost_per_hour"]
@@ -282,15 +284,20 @@ def optimize_dc(dc_id, cfg, *,
     # ---- DC capacity (with fallbacks) ----
     if not cap.empty:
         cap_row = cap.iloc[0]
-        max_storage = float(cap_row["total_storage_cube_ft3"])
+        max_ambient = float(cap_row["ambient_cube_ft3"])
+        max_cold = float(cap_row["cold_cube_ft3"])
         max_throughput = float(cap_row["max_daily_throughput_units"])
         max_inb_pallets = float(cap_row["max_daily_inbound_pallets"])
         max_ob_pallets = float(cap_row["max_daily_outbound_pallets"])
     else:
-        max_storage = FBK["max_storage"]
+        max_ambient = FBK["max_ambient_storage"]
+        max_cold = FBK["max_cold_storage"]
         max_throughput = FBK["max_daily_throughput"]
         max_inb_pallets = FBK["max_inbound_pallets"]
         max_ob_pallets = FBK["max_outbound_pallets"]
+
+    skus_ambient = [s for s in skus if storage_type.get(s, "AMBIENT") == "AMBIENT"]
+    skus_cold = [s for s in skus if storage_type.get(s, "AMBIENT") == "COLD"]
 
     # ---- Labor availability per period ----
     max_reg_hrs, max_ot_hrs = {}, {}
@@ -313,7 +320,8 @@ def optimize_dc(dc_id, cfg, *,
     I = pulp.LpVariable.dicts("I", ((i, t) for i in skus for t in periods), lowBound=0)
     L = pulp.LpVariable.dicts("L", periods, lowBound=0)
     O = pulp.LpVariable.dicts("O", periods, lowBound=0)
-    ss = pulp.LpVariable.dicts("ss", periods, lowBound=0)
+    ss_amb = pulp.LpVariable.dicts("ss_amb", periods, lowBound=0)
+    ss_cold = pulp.LpVariable.dicts("ss_cold", periods, lowBound=0)
     st_v = pulp.LpVariable.dicts("st", periods, lowBound=0)
     so = pulp.LpVariable.dicts("so", periods, lowBound=0)
     si = pulp.LpVariable.dicts("si", periods, lowBound=0)
@@ -322,7 +330,8 @@ def optimize_dc(dc_id, cfg, *,
         pulp.lpSum(revenue[i] * f[i, t] for i in skus for t in periods)
         - pulp.lpSum(holding_cost[i] * I[i, t] for i in skus for t in periods)
         - pulp.lpSum(regular_labor_cost * L[t] + overtime_labor_cost * O[t] for t in periods)
-        - pulp.lpSum(PEN["storage"] * ss[t] for t in periods)
+        - pulp.lpSum(PEN["storage_ambient"] * ss_amb[t] for t in periods)
+        - pulp.lpSum(PEN["storage_cold"] * ss_cold[t] for t in periods)
         - pulp.lpSum(PEN["throughput"] * st_v[t] for t in periods)
         - pulp.lpSum(PEN["outbound"] * so[t] for t in periods)
         - pulp.lpSum(PEN["inbound"] * si[t] for t in periods)
@@ -338,7 +347,8 @@ def optimize_dc(dc_id, cfg, *,
             model += f[i, t] <= demand.get((i, t), 0)
 
     for t in periods:
-        model += pulp.lpSum(cube[i] * I[i, t] for i in skus) <= max_storage + ss[t]
+        model += pulp.lpSum(cube[i] * I[i, t] for i in skus_ambient) <= max_ambient + ss_amb[t]
+        model += pulp.lpSum(cube[i] * I[i, t] for i in skus_cold) <= max_cold + ss_cold[t]
         model += pulp.lpSum(f[i, t] / tp_rate.get(i, default_tp) for i in skus) <= L[t] + O[t]
         model += L[t] <= max_reg_hrs[t]
         model += O[t] <= max_ot_hrs[t]
@@ -372,7 +382,8 @@ def optimize_dc(dc_id, cfg, *,
             })
 
     for t in periods:
-        total_cube = sum((I[i, t].varValue or 0) * cube[i] for i in skus)
+        amb_cube = sum((I[i, t].varValue or 0) * cube[i] for i in skus_ambient)
+        cold_cube = sum((I[i, t].varValue or 0) * cube[i] for i in skus_cold)
         total_ful = sum((f[i, t].varValue or 0) for i in skus)
         total_ob_pallets = sum((f[i, t].varValue or 0) / units_per_pallet[i] for i in skus)
         total_lab_need = sum((f[i, t].varValue or 0) / tp_rate.get(i, default_tp) for i in skus)
@@ -381,7 +392,8 @@ def optimize_dc(dc_id, cfg, *,
 
         overflow.append({
             "dc_id": dc_id, "period": str(t),
-            "storage_utilization_pct":      round(total_cube / max_storage * 100, 1),
+            "ambient_storage_utilization_pct": round(amb_cube / max_ambient * 100, 1) if max_ambient > 0 else 0.0,
+            "cold_storage_utilization_pct":    round(cold_cube / max_cold * 100, 1) if max_cold > 0 else 0.0,
             "throughput_utilization_pct":   round(total_ful / max_throughput * 100, 1),
             "outbound_dock_utilization_pct": round(total_ob_pallets / max_ob_pallets * 100, 1),
             "inbound_dock_utilization_pct": round(total_inb / max_inb_pallets * 100, 1) if max_inb_pallets > 0 else 0.0,
@@ -389,15 +401,18 @@ def optimize_dc(dc_id, cfg, *,
             "outbound_pallets_planned":     round(total_ob_pallets, 1),
             "inbound_pallets_planned":      round(total_inb, 1),
             "throughput_units_planned":     round(total_ful, 1),
-            "storage_overflow_cuft":        round(ss[t].varValue or 0, 1),
+            "ambient_storage_overflow_cuft": round(ss_amb[t].varValue or 0, 1),
+            "cold_storage_overflow_cuft":    round(ss_cold[t].varValue or 0, 1),
             "throughput_overflow_units":    round(st_v[t].varValue or 0, 1),
             "outbound_overflow_pallets":    round(so[t].varValue or 0, 1),
             "inbound_overflow_pallets":     round(si[t].varValue or 0, 1),
-            "storage_penalty_cost":         round((ss[t].varValue or 0) * PEN["storage"], 2),
+            "ambient_storage_penalty_cost": round((ss_amb[t].varValue or 0) * PEN["storage_ambient"], 2),
+            "cold_storage_penalty_cost":    round((ss_cold[t].varValue or 0) * PEN["storage_cold"], 2),
             "throughput_penalty_cost":      round((st_v[t].varValue or 0) * PEN["throughput"], 2),
             "outbound_penalty_cost":        round((so[t].varValue or 0) * PEN["outbound"], 2),
             "inbound_penalty_cost":         round((si[t].varValue or 0) * PEN["inbound"], 2),
-            "storage_binding":      total_cube >= max_storage * 0.99,
+            "ambient_storage_binding": amb_cube >= max_ambient * 0.99 if max_ambient > 0 else False,
+            "cold_storage_binding":    cold_cube >= max_cold * 0.99 if max_cold > 0 else False,
             "throughput_binding":   total_ful >= max_throughput * 0.99,
             "outbound_dock_binding": total_ob_pallets >= max_ob_pallets * 0.99,
             "inbound_dock_binding": total_inb >= max_inb_pallets * 0.99 if max_inb_pallets > 0 else False,
@@ -425,8 +440,11 @@ def optimize_dc(dc_id, cfg, *,
     total_rev = df_ful["revenue_contribution"].sum()
     total_hold = df_ful["holding_cost_incurred"].sum()
     total_lab_cost = df_lab["labor_cost"].sum()
-    total_penalty = (df_ov["storage_penalty_cost"].sum() + df_ov["throughput_penalty_cost"].sum()
-                     + df_ov["outbound_penalty_cost"].sum() + df_ov["inbound_penalty_cost"].sum())
+    total_penalty = (df_ov["ambient_storage_penalty_cost"].sum()
+                     + df_ov["cold_storage_penalty_cost"].sum()
+                     + df_ov["throughput_penalty_cost"].sum()
+                     + df_ov["outbound_penalty_cost"].sum()
+                     + df_ov["inbound_penalty_cost"].sum())
     total_demand = sum(demand.values())
     total_fulfilled = df_ful["fulfilled_qty"].sum()
 

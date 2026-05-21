@@ -31,8 +31,12 @@ synthetic_data:
     # then draws its dimensional and economic params from that category's
     # ranges. Ranges are tuned so the cross-category average roughly matches
     # the prior global ranges, keeping storage/throughput utilization stable.
+    # `cold_ratio` is the per-category probability a given SKU is COLD-chain
+    # (2-8°C); the rest are AMBIENT. Vaccines are always cold; brand/generic
+    # split (biologics & injectables → cold). Everything else is ambient.
     categories:
       - name: "brand-name pharmaceuticals"
+        cold_ratio: 0.30
         unit_cube_ft3:                 {min: 0.1, max: 0.5}
         unit_weight_lbs:               {min: 0.5, max: 3.0}
         revenue_per_unit:              {min: 50.0, max: 500.0}
@@ -40,6 +44,7 @@ synthetic_data:
         holding_cost_per_unit_per_day: {min: 0.05, max: 0.30}
 
       - name: "generic pharmaceuticals"
+        cold_ratio: 0.15
         unit_cube_ft3:                 {min: 0.1, max: 0.4}
         unit_weight_lbs:               {min: 0.5, max: 2.5}
         revenue_per_unit:              {min: 5.0, max: 50.0}
@@ -47,6 +52,7 @@ synthetic_data:
         holding_cost_per_unit_per_day: {min: 0.02, max: 0.10}
 
       - name: "vaccines"
+        cold_ratio: 1.00
         # Cold-chain premium drives the higher holding cost band.
         unit_cube_ft3:                 {min: 0.1, max: 0.3}
         unit_weight_lbs:               {min: 0.5, max: 2.0}
@@ -55,6 +61,7 @@ synthetic_data:
         holding_cost_per_unit_per_day: {min: 0.10, max: 0.50}
 
       - name: "over-the-counter medicines"
+        cold_ratio: 0.00
         unit_cube_ft3:                 {min: 0.2, max: 0.8}
         unit_weight_lbs:               {min: 1.0, max: 5.0}
         revenue_per_unit:              {min: 5.0, max: 40.0}
@@ -62,6 +69,7 @@ synthetic_data:
         holding_cost_per_unit_per_day: {min: 0.02, max: 0.10}
 
       - name: "health and beauty products"
+        cold_ratio: 0.00
         unit_cube_ft3:                 {min: 0.3, max: 1.2}
         unit_weight_lbs:               {min: 1.0, max: 8.0}
         revenue_per_unit:              {min: 5.0, max: 30.0}
@@ -69,6 +77,7 @@ synthetic_data:
         holding_cost_per_unit_per_day: {min: 0.01, max: 0.08}
 
       - name: "medical supplies"
+        cold_ratio: 0.00
         unit_cube_ft3:                 {min: 0.5, max: 2.0}
         unit_weight_lbs:               {min: 2.0, max: 12.0}
         revenue_per_unit:              {min: 10.0, max: 80.0}
@@ -76,6 +85,7 @@ synthetic_data:
         holding_cost_per_unit_per_day: {min: 0.02, max: 0.12}
 
       - name: "medical equipment"
+        cold_ratio: 0.00
         unit_cube_ft3:                 {min: 1.0, max: 3.0}
         unit_weight_lbs:               {min: 5.0, max: 25.0}
         revenue_per_unit:              {min: 100.0, max: 1000.0}
@@ -119,6 +129,9 @@ synthetic_data:
     # utilization on average. Bumped up from 40-80K — the smaller capacity
     # would have made the network look chronically over capacity.
     storage_cube_ft3:            {min: 150000, max: 250000}
+    # Per-DC fraction of total storage_cube_ft3 reserved for cold (2-8°C).
+    # Each DC draws independently so the network shows varied cold pressure.
+    cold_storage_ratio_rng:      {min: 0.15, max: 0.25}
     rack_ratio: 0.75
     pick_locations:              {min: 1000, max: 2500}
     inbound_dock_doors:          {min: 8,    max: 18}
@@ -221,14 +234,17 @@ optimization:
   solver_preference: ["highs", "cbc"]
 
   penalties:
-    storage: 5.0        # $ / cu ft / day
-    throughput: 2.0     # $ / unit
-    outbound: 50.0      # $ / pallet
-    inbound: 75.0       # $ / pallet
+    storage_ambient: 5.0   # $ / cu ft / day — ambient overflow penalty
+    storage_cold:   15.0   # $ / cu ft / day — cold overflow (3× ambient: reefers + spoilage risk)
+    throughput: 2.0        # $ / unit
+    outbound: 50.0         # $ / pallet
+    inbound: 75.0          # $ / pallet
 
   # Used only when a dc_capacity row is missing for a given DC
   fallback_capacities:
-    max_storage: 100000.0
+    max_storage: 100000.0          # legacy combined — kept for back-compat
+    max_ambient_storage: 80000.0
+    max_cold_storage: 20000.0
     max_daily_throughput: 50000.0
     max_inbound_pallets: 200.0
     max_outbound_pallets: 250.0
@@ -250,10 +266,11 @@ app:
   cache_ttl_seconds: 300
 
   penalty_sliders:
-    storage:    {min: 0.0, max: 25.0,  default: 5.0,  step: 0.5}
-    throughput: {min: 0.0, max: 10.0,  default: 2.0,  step: 0.25}
-    outbound:   {min: 0.0, max: 200.0, default: 50.0, step: 5.0}
-    inbound:    {min: 0.0, max: 200.0, default: 75.0, step: 5.0}
+    storage_ambient: {min: 0.0, max: 50.0,  default: 5.0,  step: 0.5}
+    storage_cold:    {min: 0.0, max: 100.0, default: 15.0, step: 1.0}
+    throughput:      {min: 0.0, max: 10.0,  default: 2.0,  step: 0.25}
+    outbound:        {min: 0.0, max: 200.0, default: 50.0, step: 5.0}
+    inbound:         {min: 0.0, max: 200.0, default: 75.0, step: 5.0}
 
   capacity_multipliers:
     storage:    {min: 0.5, max: 3.0, default: 1.0, step: 0.1}

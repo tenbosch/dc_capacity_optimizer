@@ -114,27 +114,47 @@ def load_network_summary():
       d.region,
       d.automation_level,
       c.total_storage_cube_ft3,
+      c.ambient_cube_ft3,
+      c.cold_cube_ft3,
       c.max_daily_throughput_units,
       c.max_daily_inbound_pallets,
       c.max_daily_outbound_pallets,
-      COALESCE(inv.on_hand_units, 0)      AS on_hand_units,
-      COALESCE(inv.inventory_cube_ft3, 0) AS inventory_cube_ft3,
-      COALESCE(dem.total_demand_units, 0) AS total_demand_units,
-      COALESCE(dem.n_skus, 0)             AS n_skus,
-      COALESCE(dem.n_periods, 0)          AS n_periods,
+      COALESCE(inv.on_hand_units, 0)              AS on_hand_units,
+      COALESCE(inv.inventory_cube_ft3, 0)         AS inventory_cube_ft3,
+      COALESCE(inv.ambient_inventory_cube_ft3, 0) AS ambient_inventory_cube_ft3,
+      COALESCE(inv.cold_inventory_cube_ft3, 0)    AS cold_inventory_cube_ft3,
+      COALESCE(dem.total_demand_units, 0)         AS total_demand_units,
+      COALESCE(dem.n_skus, 0)                     AS n_skus,
+      COALESCE(dem.n_periods, 0)                  AS n_periods,
       ROUND(
         100.0 * COALESCE(inv.inventory_cube_ft3, 0)
               / NULLIF(c.total_storage_cube_ft3, 0),
         1
-      ) AS storage_util_pct
+      ) AS storage_util_pct,
+      ROUND(
+        100.0 * COALESCE(inv.ambient_inventory_cube_ft3, 0)
+              / NULLIF(c.ambient_cube_ft3, 0),
+        1
+      ) AS ambient_util_pct,
+      ROUND(
+        100.0 * COALESCE(inv.cold_inventory_cube_ft3, 0)
+              / NULLIF(c.cold_cube_ft3, 0),
+        1
+      ) AS cold_util_pct
     FROM {SCHEMA}.distribution_centers d
     JOIN {SCHEMA}.dc_capacity c USING (dc_id)
     LEFT JOIN (
-      SELECT dc_id,
-             SUM(on_hand_units)  AS on_hand_units,
-             SUM(total_cube_ft3) AS inventory_cube_ft3
-      FROM {SCHEMA}.inventory_levels
-      GROUP BY dc_id
+      SELECT
+        i.dc_id,
+        SUM(i.on_hand_units)  AS on_hand_units,
+        SUM(i.total_cube_ft3) AS inventory_cube_ft3,
+        SUM(CASE WHEN p.storage_type = 'AMBIENT' THEN i.total_cube_ft3 ELSE 0 END)
+                              AS ambient_inventory_cube_ft3,
+        SUM(CASE WHEN p.storage_type = 'COLD'    THEN i.total_cube_ft3 ELSE 0 END)
+                              AS cold_inventory_cube_ft3
+      FROM {SCHEMA}.inventory_levels i
+      JOIN {SCHEMA}.product_master p USING (sku_id)
+      GROUP BY i.dc_id
     ) inv USING (dc_id)
     LEFT JOIN (
       SELECT dc_id,
@@ -154,15 +174,18 @@ def load_network_summary():
     # the figure to silently render empty.
     numeric_cols = [
         "latitude", "longitude",
-        "total_storage_cube_ft3", "max_daily_throughput_units",
+        "total_storage_cube_ft3", "ambient_cube_ft3", "cold_cube_ft3",
+        "max_daily_throughput_units",
         "max_daily_inbound_pallets", "max_daily_outbound_pallets",
         "on_hand_units", "inventory_cube_ft3",
+        "ambient_inventory_cube_ft3", "cold_inventory_cube_ft3",
         "total_demand_units", "n_skus", "n_periods",
-        "storage_util_pct",
+        "storage_util_pct", "ambient_util_pct", "cold_util_pct",
     ]
     for col in numeric_cols:
         if col in df.columns:
             df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0).astype(float)
+    df["worst_util_pct"] = df[["ambient_util_pct", "cold_util_pct"]].max(axis=1)
     return df
 
 
@@ -505,9 +528,9 @@ def render_about():
 def render_map(df_summary, df_ndc_summary=None):
     st.markdown("### \U0001f5fa️ Distribution Center Network")
     st.caption(
-        "Green/red circles = Wholesale DCs (color = current storage utilization, "
-        "size = storage capacity). Dark-blue diamonds = National DCs (cross-dock). "
-        "Hover any pin for stats; pick a DC below to drill in."
+        "Green/red circles = Wholesale DCs (color = worst-of ambient/cold storage "
+        "utilization, size = total storage capacity). Dark-blue diamonds = "
+        "National DCs (cross-dock). Hover any pin for stats; pick a DC below to drill in."
     )
 
     if df_summary.empty:
@@ -522,10 +545,12 @@ def render_map(df_summary, df_ndc_summary=None):
     df["marker_size"] = np.clip(df["total_storage_cube_ft3"] / 2500.0, 10, 32)
 
     customdata = df[[
-        "dc_id", "facility_name", "city", "state_code", "region",
-        "on_hand_units", "storage_util_pct", "total_demand_units",
-        "n_skus", "n_periods", "automation_level",
-        "total_storage_cube_ft3", "max_daily_throughput_units",
+        "dc_id", "facility_name", "city", "state_code", "region",          # 0-4
+        "on_hand_units", "worst_util_pct", "total_demand_units",           # 5-7
+        "n_skus", "n_periods", "automation_level",                         # 8-10
+        "total_storage_cube_ft3", "max_daily_throughput_units",            # 11-12
+        "ambient_util_pct", "cold_util_pct",                               # 13-14
+        "ambient_cube_ft3", "cold_cube_ft3",                               # 15-16
     ]].values
 
     fig = go.Figure()
@@ -540,8 +565,10 @@ def render_map(df_summary, df_ndc_summary=None):
             "%{customdata[2]}, %{customdata[3]} · %{customdata[4]}<br>"
             "<br>"
             "On-hand: %{customdata[5]:,.0f} units<br>"
-            "Storage util: %{customdata[6]:.1f}%<br>"
-            "Storage capacity: %{customdata[11]:,.0f} cu ft<br>"
+            "Ambient util: %{customdata[13]:.1f}% of %{customdata[15]:,.0f} cu ft<br>"
+            "Cold util: %{customdata[14]:.1f}% of %{customdata[16]:,.0f} cu ft<br>"
+            "Worst-of-two: %{customdata[6]:.1f}%<br>"
+            "Total storage capacity: %{customdata[11]:,.0f} cu ft<br>"
             "Max throughput: %{customdata[12]:,.0f} units/day<br>"
             "Demand (%{customdata[9]}d horizon): %{customdata[7]:,.0f} units<br>"
             "SKUs: %{customdata[8]}<br>"
@@ -550,10 +577,10 @@ def render_map(df_summary, df_ndc_summary=None):
         ),
         marker=dict(
             size=df["marker_size"],
-            color=df["storage_util_pct"].astype(float),
+            color=df["worst_util_pct"].astype(float),
             colorscale="RdYlGn_r",
             cmin=0, cmax=100,
-            colorbar=dict(title="WDC<br>Storage<br>Util %", thickness=12, len=0.6,
+            colorbar=dict(title="WDC<br>Worst<br>Util %", thickness=12, len=0.6,
                           x=1.02),
             line=dict(width=1, color="white"),
         ),
@@ -1166,7 +1193,8 @@ def _make_solver():
 
 def run_optimization(df_products, df_demand, df_inventory, df_capacity,
                      df_labor, df_throughput, df_inbound, df_params,
-                     penalty_stor, penalty_tp, penalty_ob, penalty_ib,
+                     penalty_stor_amb, penalty_stor_cold,
+                     penalty_tp, penalty_ob, penalty_ib,
                      cap_mult=1.0, tp_mult=1.0):
     """Build and solve the LP for a single DC. Returns results dict or None."""
     skus = sorted(df_products["sku_id"].unique())
@@ -1177,6 +1205,10 @@ def run_optimization(df_products, df_demand, df_inventory, df_capacity,
     cube = dict(zip(df_products["sku_id"], df_products["unit_cube_ft3"]))
     upp = dict(zip(df_products["sku_id"],
                    df_products["units_per_case"] * df_products["cases_per_pallet"]))
+    storage_type = dict(zip(df_products["sku_id"],
+                            df_products.get("storage_type", pd.Series(["AMBIENT"] * len(df_products)))))
+    skus_amb = [s for s in skus if storage_type.get(s, "AMBIENT") == "AMBIENT"]
+    skus_cold = [s for s in skus if storage_type.get(s, "AMBIENT") == "COLD"]
 
     regular_labor_cost = OPT["default_regular_labor_cost_per_hour"]
     overtime_labor_cost = OPT["default_overtime_labor_cost_per_hour"]
@@ -1202,7 +1234,8 @@ def run_optimization(df_products, df_demand, df_inventory, df_capacity,
     default_tp = OPT["default_throughput_rate_units_per_hour"]
 
     cap = df_capacity.iloc[0]
-    max_storage = float(cap["total_storage_cube_ft3"]) * cap_mult
+    max_ambient = float(cap.get("ambient_cube_ft3", 0) or 0) * cap_mult
+    max_cold = float(cap.get("cold_cube_ft3", 0) or 0) * cap_mult
     max_throughput = float(cap["max_daily_throughput_units"]) * tp_mult
     max_inb_pallets = float(cap["max_daily_inbound_pallets"])
     max_ob_pallets = float(cap["max_daily_outbound_pallets"])
@@ -1225,7 +1258,8 @@ def run_optimization(df_products, df_demand, df_inventory, df_capacity,
     I = pulp.LpVariable.dicts("I", ((i, t) for i in skus for t in periods), lowBound=0)
     L = pulp.LpVariable.dicts("L", periods, lowBound=0)
     O = pulp.LpVariable.dicts("O", periods, lowBound=0)
-    ss = pulp.LpVariable.dicts("ss", periods, lowBound=0)
+    ss_amb = pulp.LpVariable.dicts("ss_amb", periods, lowBound=0)
+    ss_cold = pulp.LpVariable.dicts("ss_cold", periods, lowBound=0)
     st_var = pulp.LpVariable.dicts("st", periods, lowBound=0)
     so = pulp.LpVariable.dicts("so", periods, lowBound=0)
     si = pulp.LpVariable.dicts("si", periods, lowBound=0)
@@ -1234,7 +1268,8 @@ def run_optimization(df_products, df_demand, df_inventory, df_capacity,
         pulp.lpSum(revenue[i] * f[i, t] for i in skus for t in periods)
         - pulp.lpSum(holding_cost[i] * I[i, t] for i in skus for t in periods)
         - pulp.lpSum(regular_labor_cost * L[t] + overtime_labor_cost * O[t] for t in periods)
-        - pulp.lpSum(penalty_stor * ss[t] for t in periods)
+        - pulp.lpSum(penalty_stor_amb * ss_amb[t] for t in periods)
+        - pulp.lpSum(penalty_stor_cold * ss_cold[t] for t in periods)
         - pulp.lpSum(penalty_tp * st_var[t] for t in periods)
         - pulp.lpSum(penalty_ob * so[t] for t in periods)
         - pulp.lpSum(penalty_ib * si[t] for t in periods)
@@ -1250,7 +1285,8 @@ def run_optimization(df_products, df_demand, df_inventory, df_capacity,
             model += f[i, t] <= demand.get((i, t), 0)
 
     for t in periods:
-        model += pulp.lpSum(cube[i] * I[i, t] for i in skus) <= max_storage + ss[t]
+        model += pulp.lpSum(cube[i] * I[i, t] for i in skus_amb) <= max_ambient + ss_amb[t]
+        model += pulp.lpSum(cube[i] * I[i, t] for i in skus_cold) <= max_cold + ss_cold[t]
         model += pulp.lpSum(f[i, t] / tp_rate.get(i, default_tp) for i in skus) <= L[t] + O[t]
         model += L[t] <= max_reg_hrs[t]
         model += O[t] <= max_ot_hrs[t]
@@ -1279,7 +1315,8 @@ def run_optimization(df_products, df_demand, df_inventory, df_capacity,
 
     overflow = []
     for t in periods:
-        total_cube = sum((I[i, t].varValue or 0) * cube[i] for i in skus)
+        amb_cube = sum((I[i, t].varValue or 0) * cube[i] for i in skus_amb)
+        cold_cube = sum((I[i, t].varValue or 0) * cube[i] for i in skus_cold)
         total_ful = sum((f[i, t].varValue or 0) for i in skus)
         outbound_pallets = sum((f[i, t].varValue or 0) / upp[i] for i in skus)
         inbound_pallets = sum(inbound_pallets_map.get((i, t), 0) for i in skus)
@@ -1287,21 +1324,24 @@ def run_optimization(df_products, df_demand, df_inventory, df_capacity,
         ib_util_pct = (inbound_pallets / max_inb_pallets * 100) if max_inb_pallets > 0 else 0
         overflow.append({
             "period": str(t),
-            "storage_util_pct":    round(total_cube / max_storage * 100, 1) if max_storage > 0 else 0,
+            "ambient_util_pct":    round(amb_cube / max_ambient * 100, 1) if max_ambient > 0 else 0,
+            "cold_util_pct":       round(cold_cube / max_cold * 100, 1) if max_cold > 0 else 0,
             "throughput_util_pct": round(total_ful / max_throughput * 100, 1) if max_throughput > 0 else 0,
             "outbound_util_pct":   round(ob_util_pct, 1),
             "inbound_util_pct":    round(ib_util_pct, 1),
             "outbound_pallets":    round(outbound_pallets, 1),
             "inbound_pallets":     round(inbound_pallets, 1),
             "throughput_units":    round(total_ful, 1),
-            "storage_overflow":    round(ss[t].varValue or 0, 1),
+            "ambient_overflow":    round(ss_amb[t].varValue or 0, 1),
+            "cold_overflow":       round(ss_cold[t].varValue or 0, 1),
             "throughput_overflow": round(st_var[t].varValue or 0, 1),
             "outbound_overflow":   round(so[t].varValue or 0, 1),
             "inbound_overflow":    round(si[t].varValue or 0, 1),
-            "storage_penalty":    round((ss[t].varValue or 0) * penalty_stor, 2),
-            "throughput_penalty": round((st_var[t].varValue or 0) * penalty_tp, 2),
-            "outbound_penalty":   round((so[t].varValue or 0) * penalty_ob, 2),
-            "inbound_penalty":    round((si[t].varValue or 0) * penalty_ib, 2),
+            "ambient_penalty":     round((ss_amb[t].varValue or 0) * penalty_stor_amb, 2),
+            "cold_penalty":        round((ss_cold[t].varValue or 0) * penalty_stor_cold, 2),
+            "throughput_penalty":  round((st_var[t].varValue or 0) * penalty_tp, 2),
+            "outbound_penalty":    round((so[t].varValue or 0) * penalty_ob, 2),
+            "inbound_penalty":     round((si[t].varValue or 0) * penalty_ib, 2),
         })
 
     labor_out = []
@@ -1319,7 +1359,8 @@ def run_optimization(df_products, df_demand, df_inventory, df_capacity,
     df_lab = pd.DataFrame(labor_out)
 
     total_rev = df_ful["revenue"].sum()
-    total_penalty = (df_ov["storage_penalty"].sum() + df_ov["throughput_penalty"].sum()
+    total_penalty = (df_ov["ambient_penalty"].sum() + df_ov["cold_penalty"].sum()
+                     + df_ov["throughput_penalty"].sum()
                      + df_ov["outbound_penalty"].sum() + df_ov["inbound_penalty"].sum())
     total_labor_cost = sum(
         (L[t].varValue or 0) * regular_labor_cost
@@ -1341,7 +1382,9 @@ def run_optimization(df_products, df_demand, df_inventory, df_capacity,
         "fill_rate": float(df_ful["fulfilled"].sum() / total_demand_units * 100)
                      if total_demand_units > 0 else 0.0,
         "solver_name": solver_name,
-        "max_storage": float(max_storage),
+        "max_ambient": float(max_ambient),
+        "max_cold": float(max_cold),
+        "max_storage": float(max_ambient + max_cold),
         "max_throughput": float(max_throughput),
         "max_ob_pallets": float(max_ob_pallets),
         "max_inb_pallets": float(max_inb_pallets),
@@ -1566,8 +1609,8 @@ def _render_dc_accuracy_section(dc_id, df_products, selected_category):
         with tab_inv:
             st.caption(
                 "At-risk SKUs from current `inventory_levels` (low days-of-supply). "
-                "If the optimization run below reports `storage_overflow > 0`, "
-                "storage capacity is the binding constraint."
+                "If the optimization run below reports `ambient_overflow > 0` or "
+                "`cold_overflow > 0`, that storage type is the binding constraint."
             )
             inv_q = f"""
             SELECT i.sku_id, p.product_category, i.on_hand_units, i.days_of_supply
@@ -1719,11 +1762,12 @@ def render_detail(dc_id, df_summary):
     st.subheader("\U0001f4e6 Current Inventory Position")
 
     df_inv_enriched = df_inventory.merge(
-        df_products[["sku_id", "product_category", "unit_cube_ft3", "revenue_per_unit",
+        df_products[["sku_id", "product_category", "storage_type", "unit_cube_ft3", "revenue_per_unit",
                      "holding_cost_per_unit_per_day",
                      "units_per_case", "cases_per_pallet"]],
         on="sku_id", how="left",
     )
+    df_inv_enriched["storage_type"] = df_inv_enriched["storage_type"].fillna("AMBIENT")
     df_inv_enriched["total_cube_ft3"] = (
         df_inv_enriched["on_hand_units"] * df_inv_enriched["unit_cube_ft3"]
     )
@@ -1745,22 +1789,56 @@ def render_detail(dc_id, df_summary):
     n_periods = max(int(df_demand["forecast_date"].nunique()), 1)
 
     cap_row = df_capacity.iloc[0]
-    total_storage_capacity = float(cap_row["total_storage_cube_ft3"])
-    current_total_cube = df_inv_enriched["total_cube_ft3"].sum()
-    storage_util_pct = (
-        current_total_cube / total_storage_capacity * 100
-        if total_storage_capacity > 0 else 0.0
-    )
+    ambient_capacity = float(cap_row.get("ambient_cube_ft3", 0) or 0)
+    cold_capacity = float(cap_row.get("cold_cube_ft3", 0) or 0)
+    amb_cube = df_inv_enriched.loc[df_inv_enriched["storage_type"] == "AMBIENT", "total_cube_ft3"].sum()
+    cold_cube = df_inv_enriched.loc[df_inv_enriched["storage_type"] == "COLD", "total_cube_ft3"].sum()
+    amb_util_pct = (amb_cube / ambient_capacity * 100) if ambient_capacity > 0 else 0.0
+    cold_util_pct = (cold_cube / cold_capacity * 100) if cold_capacity > 0 else 0.0
 
-    inv_col1, inv_col2, inv_col3, inv_col4 = st.columns(4)
+    inv_col1, inv_col2, inv_col3, inv_col4, inv_col5 = st.columns(5)
     inv_col1.metric("Total Units On-Hand", f"{df_inv_enriched['on_hand_units'].sum():,.0f}")
     inv_col2.metric(
-        "Storage Utilization", f"{storage_util_pct:.1f}%",
-        delta=f"{storage_util_pct - 100:.1f}% vs capacity" if storage_util_pct > 100 else None,
+        "Ambient Util",
+        f"{amb_util_pct:.1f}%",
+        delta=f"{amb_util_pct - 100:.1f}% vs cap" if amb_util_pct > 100 else None,
         delta_color="inverse",
+        help=f"{amb_cube:,.0f} / {ambient_capacity:,.0f} cu ft",
     )
-    inv_col3.metric("Inventory Value", f"${df_inv_enriched['inventory_value'].sum():,.0f}")
-    inv_col4.metric("Daily Holding Cost", f"${df_inv_enriched['daily_holding_cost'].sum():,.0f}")
+    inv_col3.metric(
+        "Cold Util",
+        f"{cold_util_pct:.1f}%",
+        delta=f"{cold_util_pct - 100:.1f}% vs cap" if cold_util_pct > 100 else None,
+        delta_color="inverse",
+        help=f"{cold_cube:,.0f} / {cold_capacity:,.0f} cu ft",
+    )
+    inv_col4.metric("Inventory Value", f"${df_inv_enriched['inventory_value'].sum():,.0f}")
+    inv_col5.metric("Daily Holding Cost", f"${df_inv_enriched['daily_holding_cost'].sum():,.0f}")
+
+    # Side-by-side capacity-vs-current bar for each storage type.
+    storage_df = pd.DataFrame({
+        "Type": ["Ambient", "Cold"],
+        "Used (cu ft)":    [amb_cube, cold_cube],
+        "Capacity (cu ft)": [ambient_capacity, cold_capacity],
+    })
+    fig_storage = go.Figure()
+    fig_storage.add_trace(go.Bar(
+        x=storage_df["Type"], y=storage_df["Used (cu ft)"],
+        name="Used", marker_color=["#636EFA", "#19D3F3"],
+    ))
+    fig_storage.add_trace(go.Bar(
+        x=storage_df["Type"], y=storage_df["Capacity (cu ft)"] - storage_df["Used (cu ft)"],
+        name="Available", marker_color=["#D3D3D3", "#D3D3D3"],
+    ))
+    fig_storage.update_layout(
+        barmode="stack",
+        height=260,
+        margin=dict(l=10, r=10, t=30, b=10),
+        title="Storage capacity by type",
+        yaxis_title="cu ft",
+        showlegend=True,
+    )
+    st.plotly_chart(fig_storage, use_container_width=True)
 
     # Roll up to product_category or filter to one category's SKUs.
     df_inv_view = category_or_sku(
@@ -1802,7 +1880,8 @@ def render_detail(dc_id, df_summary):
             labels={"total_cube_ft3": "Cubic Feet", "group_label": group_axis_label},
             color_discrete_sequence=["#636EFA"],
         )
-        if len(df_inv_view) > 0:
+        total_storage_capacity = ambient_capacity + cold_capacity
+        if len(df_inv_view) > 0 and total_storage_capacity > 0:
             fig_cube.add_hline(
                 y=total_storage_capacity / len(df_inv_view),
                 line_dash="dash", line_color="red",
@@ -2067,13 +2146,21 @@ def render_detail(dc_id, df_summary):
     st.sidebar.markdown("Adjust penalty costs to model different operational strategies.")
 
     st.sidebar.subheader("Penalty Costs")
-    penalty_storage = st.sidebar.slider(
-        "Storage overflow ($/cu ft/day)",
-        min_value=float(PSLIDERS["storage"]["min"]),
-        max_value=float(PSLIDERS["storage"]["max"]),
-        value=float(PSLIDERS["storage"]["default"]),
-        step=float(PSLIDERS["storage"]["step"]),
-        help="Cost of renting overflow storage per cubic foot per day",
+    penalty_storage_ambient = st.sidebar.slider(
+        "Ambient storage overflow ($/cu ft/day)",
+        min_value=float(PSLIDERS["storage_ambient"]["min"]),
+        max_value=float(PSLIDERS["storage_ambient"]["max"]),
+        value=float(PSLIDERS["storage_ambient"]["default"]),
+        step=float(PSLIDERS["storage_ambient"]["step"]),
+        help="Cost of renting overflow ambient storage per cubic foot per day",
+    )
+    penalty_storage_cold = st.sidebar.slider(
+        "Cold storage overflow ($/cu ft/day)",
+        min_value=float(PSLIDERS["storage_cold"]["min"]),
+        max_value=float(PSLIDERS["storage_cold"]["max"]),
+        value=float(PSLIDERS["storage_cold"]["default"]),
+        step=float(PSLIDERS["storage_cold"]["step"]),
+        help="Cost of renting overflow cold (2-8°C) storage per cubic foot per day. Typically 3-5x ambient (reefer rental + spoilage risk).",
     )
     penalty_throughput = st.sidebar.slider(
         "Throughput overflow ($/unit)",
@@ -2122,8 +2209,12 @@ def render_detail(dc_id, df_summary):
     enable_comparison = st.sidebar.checkbox("Enable scenario comparison", value=False)
     if enable_comparison:
         st.sidebar.markdown("**Comparison scenario penalties:**")
-        comp_penalty_storage = st.sidebar.number_input(
-            "Comp: Storage ($/cu ft)", value=2 * float(PSLIDERS["storage"]["default"]))
+        comp_penalty_storage_ambient = st.sidebar.number_input(
+            "Comp: Ambient storage ($/cu ft)",
+            value=2 * float(PSLIDERS["storage_ambient"]["default"]))
+        comp_penalty_storage_cold = st.sidebar.number_input(
+            "Comp: Cold storage ($/cu ft)",
+            value=2 * float(PSLIDERS["storage_cold"]["default"]))
         comp_penalty_throughput = st.sidebar.number_input(
             "Comp: Throughput ($/unit)", value=2 * float(PSLIDERS["throughput"]["default"]))
         comp_penalty_outbound = st.sidebar.number_input(
@@ -2139,7 +2230,8 @@ def render_detail(dc_id, df_summary):
             results = run_optimization(
                 df_products, df_demand, df_inventory, df_capacity,
                 df_labor, df_throughput, df_inbound, df_params,
-                penalty_storage, penalty_throughput, penalty_outbound, penalty_inbound,
+                penalty_storage_ambient, penalty_storage_cold,
+                penalty_throughput, penalty_outbound, penalty_inbound,
                 capacity_multiplier, throughput_multiplier,
             )
             st.session_state[RESULTS_KEY] = results
@@ -2147,7 +2239,8 @@ def render_detail(dc_id, df_summary):
                 comp_results = run_optimization(
                     df_products, df_demand, df_inventory, df_capacity,
                     df_labor, df_throughput, df_inbound, df_params,
-                    comp_penalty_storage, comp_penalty_throughput,
+                    comp_penalty_storage_ambient, comp_penalty_storage_cold,
+                    comp_penalty_throughput,
                     comp_penalty_outbound, comp_penalty_inbound,
                     capacity_multiplier, throughput_multiplier,
                 )
@@ -2220,8 +2313,10 @@ def render_detail(dc_id, df_summary):
 
         with tab1:
             fig = go.Figure()
-            fig.add_trace(go.Bar(x=df_ov["period"], y=df_ov["storage_util_pct"],
-                                 name="Storage %", marker_color="#636EFA"))
+            fig.add_trace(go.Bar(x=df_ov["period"], y=df_ov["ambient_util_pct"],
+                                 name="Ambient storage %", marker_color="#636EFA"))
+            fig.add_trace(go.Bar(x=df_ov["period"], y=df_ov["cold_util_pct"],
+                                 name="Cold storage %", marker_color="#19D3F3"))
             fig.add_trace(go.Bar(x=df_ov["period"], y=df_ov["throughput_util_pct"],
                                  name="Throughput %", marker_color="#EF553B"))
             fig.add_trace(go.Bar(x=df_ov["period"], y=df_ov.get("outbound_util_pct", 0),
@@ -2230,13 +2325,14 @@ def render_detail(dc_id, df_summary):
                                  name="Inbound dock %", marker_color="#FFA15A"))
             fig.add_hline(y=100, line_dash="dash", line_color="red",
                           annotation_text="Capacity limit")
-            fig.update_layout(title="Capacity Utilization by Period (all 4 constraints)",
+            fig.update_layout(title="Capacity Utilization by Period (5 constraints)",
                               yaxis_title="Utilization %", barmode="group", height=420)
             st.plotly_chart(fig, use_container_width=True)
             st.caption(
                 "Each bar shows how much of that constraint's daily capacity the "
                 "optimizer's plan consumes. Anything over 100% becomes overflow "
-                "(see the Overflow Analysis tab)."
+                "(see the Overflow Analysis tab). Ambient and cold storage are "
+                "separate constraints — cold capacity is typically the scarcer one."
             )
 
         with tab2:
@@ -2298,10 +2394,11 @@ def render_detail(dc_id, df_summary):
         with tab3:
             penalty_breakdown = pd.DataFrame({
                 "Period": df_ov["period"],
-                "Storage ($)": df_ov["storage_penalty"],
-                "Throughput ($)": df_ov["throughput_penalty"],
-                "Outbound ($)": df_ov["outbound_penalty"],
-                "Inbound ($)": df_ov["inbound_penalty"],
+                "Ambient storage ($)": df_ov["ambient_penalty"],
+                "Cold storage ($)":    df_ov["cold_penalty"],
+                "Throughput ($)":      df_ov["throughput_penalty"],
+                "Outbound ($)":        df_ov["outbound_penalty"],
+                "Inbound ($)":         df_ov["inbound_penalty"],
             })
             fig2 = px.bar(
                 penalty_breakdown.melt(id_vars="Period", var_name="Type", value_name="Cost"),
@@ -2319,7 +2416,8 @@ def render_detail(dc_id, df_summary):
             )
             overflow_qty = pd.DataFrame({
                 "Period": df_ov["period"],
-                "Storage overflow (cu ft)":    df_ov["storage_overflow"],
+                "Ambient overflow (cu ft)":    df_ov["ambient_overflow"],
+                "Cold overflow (cu ft)":       df_ov["cold_overflow"],
                 "Throughput overflow (units)": df_ov["throughput_overflow"],
                 "Outbound overflow (pallets)": df_ov["outbound_overflow"],
                 "Inbound overflow (pallets)":  df_ov["inbound_overflow"],

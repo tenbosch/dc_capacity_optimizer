@@ -209,10 +209,16 @@ products = []
 for sku in sku_ids:
     cat = categories[int(np.random.randint(0, len(categories)))]
     cat_name = cat["name"]
+    # Per-SKU storage type — drawn from the category's cold_ratio. Vaccines
+    # always cold; brand/generic split (biologics & injectables); everything
+    # else ambient.
+    cold_ratio = float(cat.get("cold_ratio", 0.0))
+    storage_type = "COLD" if np.random.random() < cold_ratio else "AMBIENT"
     products.append({
         "sku_id": sku,
         "sku_description": f"{cat_name.title()} {sku}",
         "product_category": cat_name,
+        "storage_type": storage_type,
         "unit_cube_ft3":   round(float(runif(cat["unit_cube_ft3"])), 2),
         "unit_weight_lbs": round(float(runif(cat["unit_weight_lbs"])), 2),
         "units_per_case":   int(rchoice(sku_cfg["units_per_case_choices"])),
@@ -239,6 +245,7 @@ add_table_metadata(
         "sku_id": "Stock-keeping unit identifier (e.g. SKU-0042). Primary key.",
         "sku_description": "Human-readable product description, prefixed with the pharma category.",
         "product_category": "Pharma product category: brand-name pharmaceuticals, generic pharmaceuticals, vaccines, over-the-counter medicines, health and beauty products, medical supplies, or medical equipment.",
+        "storage_type": "Storage chain: AMBIENT (room-temperature) or COLD (2-8°C). Drawn from the category cold_ratio in config.yaml.",
         "unit_cube_ft3": "Volume per single unit in cubic feet.",
         "unit_weight_lbs": "Weight per single unit in pounds.",
         "units_per_case": "Eaches per case for this SKU.",
@@ -253,22 +260,31 @@ add_table_metadata(
 )
 add_constraints("product_master", ["sku_id"])
 
-print(f"  ✓ product_master: {len(products)} rows")
+_n_cold = sum(1 for p in products if p["storage_type"] == "COLD")
+print(f"  ✓ product_master: {len(products)} rows "
+      f"({_n_cold} COLD, {len(products) - _n_cold} AMBIENT)")
 
 # COMMAND ----------
 
 # DBTITLE 1,dc_capacity
 cap_cfg = SD["dc_capacity"]
+cold_ratio_rng = cap_cfg.get("cold_storage_ratio_rng", {"min": 0.15, "max": 0.25})
 capacity_rows = []
 for dc in dc_ids:
     storage_positions = int(rint(cap_cfg["storage_positions"]))
     rack_positions = int(storage_positions * cap_cfg["rack_ratio"])
     floor_positions = storage_positions - rack_positions
+    total_cube = round(float(runif(cap_cfg["storage_cube_ft3"])), 2)
+    dc_cold_ratio = float(runif(cold_ratio_rng))
+    cold_cube = round(total_cube * dc_cold_ratio, 2)
+    ambient_cube = round(total_cube - cold_cube, 2)
     capacity_rows.append({
         "dc_id": dc,
         "effective_date": date(2025, 1, 1),
         "total_storage_positions": storage_positions,
-        "total_storage_cube_ft3": round(float(runif(cap_cfg["storage_cube_ft3"])), 2),
+        "total_storage_cube_ft3": total_cube,
+        "ambient_cube_ft3": ambient_cube,
+        "cold_cube_ft3": cold_cube,
         "rack_positions": rack_positions,
         "floor_positions": floor_positions,
         "pick_locations": int(rint(cap_cfg["pick_locations"])),
@@ -295,7 +311,9 @@ add_table_metadata(
         "dc_id": "Distribution center identifier; FK to distribution_centers.",
         "effective_date": "Date this capacity row becomes effective.",
         "total_storage_positions": "Total pallet positions across rack and floor.",
-        "total_storage_cube_ft3": "Total storage volume in cubic feet.",
+        "total_storage_cube_ft3": "Total storage volume in cubic feet (ambient + cold).",
+        "ambient_cube_ft3": "Cubic feet of ambient (room-temperature) storage capacity.",
+        "cold_cube_ft3": "Cubic feet of cold-chain (2-8°C) storage capacity.",
         "rack_positions": "Pallet positions in racks.",
         "floor_positions": "Pallet positions on the floor.",
         "pick_locations": "Number of forward-pick locations.",
@@ -328,13 +346,13 @@ demand_cfg = SD["demand"]
 acc_cfg = demand_cfg.get("accuracy", {})
 mape_rng = acc_cfg.get("mape_per_sku_rng", {"min": 0.05, "max": 0.30})
 bias_rng = acc_cfg.get("bias_pct_rng",     {"min": -0.12, "max": 0.12})
-today_dt = date.today()
 
 demand_rows = []
-# Each (DC, SKU) gets its own baseline demand level; daily values vary around it.
-# Historical rows (forecast_date < today) carry actual_units derived from the
-# forecast via per-SKU bias + N(0, mape) noise. Future rows leave actual_units
-# NULL — the Forecast Accuracy dashboard filters on `actual_units IS NOT NULL`.
+# History window (forecast_date < start_date) carries actual_units derived
+# from the forecast via per-SKU bias + N(0, mape) noise. Planning-horizon
+# rows leave actual_units NULL. We key on start_date (not today's date) so
+# the split is deterministic for a given config and the LP always has a
+# non-empty planning horizon, even when start_date is in the calendar past.
 for dc in dc_ids:
     for sku in sku_ids:
         prod = products_by_sku[sku]
@@ -345,7 +363,7 @@ for dc in dc_ids:
             qty = int(base * float(runif(demand_cfg["daily_variance"])))
             cases = qty // prod["units_per_case"]
             pallets = cases / prod["cases_per_pallet"]
-            if d < today_dt:
+            if d < start_date:
                 noise = float(np.clip(np.random.normal(0.0, sku_mape), -3 * sku_mape, 3 * sku_mape))
                 actual = max(0, int(round(qty * (1.0 + sku_bias) * (1.0 + noise))))
             else:
