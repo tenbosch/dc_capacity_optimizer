@@ -159,9 +159,11 @@ if not df_dc_meta.empty:
 
 # Restrict demand to the forward planning horizon — historical rows (those with
 # actual_units populated) drive the Forecast Accuracy dashboard, not the LP.
-if not df_demand.empty:
-    planning_start = pd.to_datetime(cfg["synthetic_data"]["planning"]["start_date"]).date()
-    df_demand = df_demand[df_demand["forecast_date"] >= planning_start].copy()
+# Filter on actual_units IS NULL to match the contract used by app.py and the
+# inbound/outbound filters below; the generator no longer pins a start_date in
+# config, so date comparisons would need a runtime computation.
+if not df_demand.empty and "actual_units" in df_demand.columns:
+    df_demand = df_demand[df_demand["actual_units"].isna()].copy()
     print(f"  → filtered demand_forecast to forward horizon: {len(df_demand)} rows")
 
 # Inbound/outbound history rows have actual_date / actual_ship_date populated;

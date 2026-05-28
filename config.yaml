@@ -21,9 +21,9 @@ synthetic_data:
     facility_type: "Wholesale DC"        # filter applied when reading the table
 
   skus:
-    n_skus: 100
+    n_skus: 20
     id_prefix: "SKU-"
-    id_padding: 4                       # → SKU-0001 … SKU-0100
+    id_padding: 4                       # → SKU-0001 … SKU-0020
     units_per_case_choices:         [6, 12, 24, 36]
     cases_per_pallet_choices:       [20, 30, 40, 50]
 
@@ -93,28 +93,58 @@ synthetic_data:
         holding_cost_per_unit_per_day: {min: 0.05, max: 0.25}
 
   planning:
-    start_date: "2025-05-17"
-    n_periods: 366                      # days in the planning horizon (1 year + today)
-    history_days: 90                    # historical actuals window ending day before start_date
+    # Dates are anchored to date.today() at generation time — the notebook
+    # uses today as the planning start_date and today-1 as the inventory
+    # snapshot_date. History extends 365 days back; forward plan goes 90
+    # days out. There is intentionally no start_date / snapshot_date key
+    # here; pinning them would freeze the data in time.
+    n_periods: 90                       # forward planning horizon (days)
+    history_days: 365                   # historical actuals window ending day before today
 
   demand:
-    # Daily demand per SKU. Sized so that 100 SKUs × midpoint(50–250) ≈ 15K
-    # units/day fits comfortably inside dc_capacity.max_daily_throughput_units
-    # (20–40K) and inside the available labor pool. Out-of-bound demand
+    # Daily demand per SKU. With n_skus=20 and midpoint(50–250)=150, baseline
+    # is ~3K units/day per DC — well inside dc_capacity.max_daily_throughput_units
+    # (20–40K) even after growth + anomaly spikes. Out-of-bound demand
     # forces unfulfilled orders → inventory accumulation → runaway storage %.
     base_units_per_sku:  {min: 50, max: 250}
     daily_variance:      {min: 0.7, max: 1.3}
     confidence:          {min: 0.7, max: 0.95}
     forecast_source: STATISTICAL_MODEL
+    # Per-SKU annual growth rate, sampled once. Applied as a multiplicative
+    # factor (1 + g)^(days_since_history_start / 365) to both demand_units
+    # and outbound units. SKU at start of history ≈ base; at today ≈ base×(1+g);
+    # at +90 days ≈ base × (1+g)^1.25. Visible trend, small enough that
+    # LP capacities still fit. Inbound is sized off demand so it grows too.
+    growth:
+      annual_rate_rng: {min: 0.01, max: 0.10}
     # Forecast-vs-actual accuracy for historical rows. Each SKU draws one
     # MAPE and one bias from these ranges; daily actuals = forecast × (1+bias)
     # × (1+N(0,mape)) clipped to ±3σ. Future rows leave actual_units NULL.
     accuracy:
       mape_per_sku_rng: {min: 0.05, max: 0.30}
       bias_pct_rng:     {min: -0.12, max: 0.12}
+    # Demand anomalies — explainable shocks in the history window that fall
+    # outside normal MAPE noise. Each SKU rolls 1–3 events over the year,
+    # each event lands on one (DC, SKU, date-range) and multiplies actual_units
+    # by a spike or drop multiplier. Events are logged in the demand_anomalies
+    # table so the demo can attribute the accuracy miss to a named reason.
+    anomalies:
+      events_per_sku_rng:    {min: 1, max: 3}
+      spike_probability:     0.5
+      spike_multiplier_rng:  {min: 1.5, max: 3.0}
+      drop_multiplier_rng:   {min: 0.0, max: 0.5}
+      duration_days_rng:     {min: 1, max: 3}
+      reasons_spike:
+        - SEASONAL_SURGE
+        - DEMAND_SHOCK
+        - MARKET_EVENT
+      reasons_drop:
+        - SEASONAL_DROP
+        - SUPPLY_DISRUPTION
+        - MARKET_EVENT
 
   inventory:
-    snapshot_date: "2025-05-16"
+    # snapshot_date is derived at runtime as today - 1 day (see planning above).
     # Inventory is now sized by days_of_supply × avg_daily_demand per (DC, SKU).
     # This produces realistic on-hand levels that bridge to the next inbound
     # receipt and keep storage % roughly stable across the horizon. The earlier

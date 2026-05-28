@@ -177,8 +177,10 @@ sku_ids = [f"{sku_cfg['id_prefix']}{str(i + 1).zfill(sku_cfg['id_padding'])}"
            for i in range(n_skus)]
 
 # --- Planning horizon ---
+# start_date is anchored to today at generation time so the demo always
+# reflects "right now" — there is no start_date key in config.yaml.
 plan_cfg = SD["planning"]
-start_date = _to_date(plan_cfg["start_date"])
+start_date = date.today()
 n_periods = plan_cfg["n_periods"]
 planning_dates = [start_date + timedelta(days=d) for d in range(n_periods)]
 
@@ -341,31 +343,112 @@ print(f"  ✓ dc_capacity: {len(capacity_rows)} rows")
 
 # COMMAND ----------
 
-# DBTITLE 1,demand_forecast
+# DBTITLE 1,demand anomalies (sample events; applied during demand_forecast)
+# Anomalies are explainable shocks that land in the history window only and
+# multiply actual_units for one (DC, SKU) over a 1–3-day stretch. The events
+# are sampled here so the demand cell can apply them in O(1) via
+# anomalies_by_key; the demand_anomalies table is written after demand_forecast
+# (we need the realized actuals to compute the per-event impact).
 demand_cfg = SD["demand"]
+anom_cfg = demand_cfg.get("anomalies", {})
+events_per_rng = anom_cfg.get("events_per_sku_rng", {"min": 1, "max": 3})
+spike_prob     = float(anom_cfg.get("spike_probability", 0.5))
+spike_mult_rng = anom_cfg.get("spike_multiplier_rng", {"min": 1.5, "max": 3.0})
+drop_mult_rng  = anom_cfg.get("drop_multiplier_rng",  {"min": 0.0, "max": 0.5})
+duration_rng   = anom_cfg.get("duration_days_rng",    {"min": 1, "max": 3})
+reasons_spike  = anom_cfg.get("reasons_spike", ["SEASONAL_SURGE", "DEMAND_SHOCK", "MARKET_EVENT"])
+reasons_drop   = anom_cfg.get("reasons_drop",  ["SEASONAL_DROP", "SUPPLY_DISRUPTION", "MARKET_EVENT"])
+
+_REASON_DESCRIPTIONS = {
+    "SEASONAL_SURGE":    "Seasonal demand surge (e.g. flu season, allergy season).",
+    "SEASONAL_DROP":     "Seasonal demand drop (off-season inventory adjustment).",
+    "SUPPLY_DISRUPTION": "Upstream supply disruption reduced available product.",
+    "DEMAND_SHOCK":      "Unforeseen demand shock (recall, formulary change, viral campaign).",
+    "MARKET_EVENT":      "Market event (competitor stockout, regulatory action, news cycle).",
+}
+
+anomaly_events = []     # list of dicts; expected/actual_units back-filled after demand cell
+anomalies_by_key = {}   # (dc_id, sku_id, date) -> anomaly_id
+
+if history_dates and anom_cfg:
+    last_history_day = history_dates[-1]
+    for sku in sku_ids:
+        n_events = max(0, int(rint(events_per_rng)))
+        for _ in range(n_events):
+            ev_dc = str(np.random.choice(dc_ids))
+            ev_start = history_dates[int(np.random.randint(0, len(history_dates)))]
+            ev_dur = max(1, int(rint(duration_rng)))
+            ev_end = min(ev_start + timedelta(days=ev_dur - 1), last_history_day)
+            if np.random.random() < spike_prob:
+                mult = float(runif(spike_mult_rng))
+                direction = "SPIKE"
+                reason = str(np.random.choice(reasons_spike))
+            else:
+                mult = float(runif(drop_mult_rng))
+                direction = "DROP"
+                reason = str(np.random.choice(reasons_drop))
+            anom_id = str(uuid.uuid4())
+            anomaly_events.append({
+                "anomaly_id": anom_id,
+                "sku_id": sku,
+                "dc_id": ev_dc,
+                "start_date": ev_start,
+                "end_date": ev_end,
+                "duration_days": (ev_end - ev_start).days + 1,
+                "direction": direction,
+                "multiplier": round(mult, 3),
+                "reason": reason,
+                "description": _REASON_DESCRIPTIONS.get(reason, reason),
+                "expected_units": 0,
+                "actual_units": 0,
+                "created_at": NOW,
+            })
+            d = ev_start
+            while d <= ev_end:
+                anomalies_by_key[(ev_dc, sku, d)] = (anom_id, mult)
+                d += timedelta(days=1)
+
+_n_spike = sum(1 for e in anomaly_events if e["direction"] == "SPIKE")
+_n_drop  = len(anomaly_events) - _n_spike
+print(f"  ✓ demand anomaly events sampled: {len(anomaly_events)} "
+      f"({_n_spike} spikes, {_n_drop} drops)")
+
+# COMMAND ----------
+
+# DBTITLE 1,demand_forecast
 acc_cfg = demand_cfg.get("accuracy", {})
 mape_rng = acc_cfg.get("mape_per_sku_rng", {"min": 0.05, "max": 0.30})
 bias_rng = acc_cfg.get("bias_pct_rng",     {"min": -0.12, "max": 0.12})
 
+growth_cfg = demand_cfg.get("growth", {})
+growth_rng = growth_cfg.get("annual_rate_rng", {"min": 0.01, "max": 0.10})
+# Growth is measured against the first history day so the timeline starts at
+# baseline and rises monotonically into the planning horizon.
+history_start = history_dates[0] if history_dates else start_date
+
 demand_rows = []
 # History window (forecast_date < start_date) carries actual_units derived
-# from the forecast via per-SKU bias + N(0, mape) noise. Planning-horizon
-# rows leave actual_units NULL. We key on start_date (not today's date) so
-# the split is deterministic for a given config and the LP always has a
-# non-empty planning horizon, even when start_date is in the calendar past.
+# from the forecast via per-SKU bias + N(0, mape) noise, then optionally
+# multiplied by an anomaly factor if the (dc, sku, date) matches a sampled
+# event. Planning-horizon rows leave actual_units NULL.
 for dc in dc_ids:
     for sku in sku_ids:
         prod = products_by_sku[sku]
         base = int(rint(demand_cfg["base_units_per_sku"]))
         sku_mape = float(runif(mape_rng))
         sku_bias = float(runif(bias_rng))
+        sku_growth = float(runif(growth_rng))
         for d in all_dates:
-            qty = int(base * float(runif(demand_cfg["daily_variance"])))
+            growth_factor = (1.0 + sku_growth) ** ((d - history_start).days / 365.0)
+            qty = int(base * float(runif(demand_cfg["daily_variance"])) * growth_factor)
             cases = qty // prod["units_per_case"]
             pallets = cases / prod["cases_per_pallet"]
             if d < start_date:
                 noise = float(np.clip(np.random.normal(0.0, sku_mape), -3 * sku_mape, 3 * sku_mape))
                 actual = max(0, int(round(qty * (1.0 + sku_bias) * (1.0 + noise))))
+                anom = anomalies_by_key.get((dc, sku, d))
+                if anom is not None:
+                    actual = max(0, int(round(actual * anom[1])))
             else:
                 actual = None
             demand_rows.append({
@@ -453,6 +536,89 @@ print(f"  ✓ demand_forecast: {len(demand_rows)} rows "
 
 # COMMAND ----------
 
+# DBTITLE 1,demand_anomalies
+# Back-fill expected_units / actual_units per event by scanning demand_rows
+# once into a (dc, sku, date) -> (demand, actual) lookup. Then aggregate
+# each event's impact over its [start_date, end_date] window.
+if anomaly_events:
+    _demand_lookup = {
+        (r["dc_id"], r["sku_id"], r["forecast_date"]): (r["demand_units"], r["actual_units"])
+        for r in demand_rows
+    }
+    for ev in anomaly_events:
+        exp_sum = 0
+        act_sum = 0
+        d = ev["start_date"]
+        while d <= ev["end_date"]:
+            row = _demand_lookup.get((ev["dc_id"], ev["sku_id"], d))
+            if row is not None:
+                exp_sum += int(row[0] or 0)
+                act_sum += int(row[1] or 0)
+            d += timedelta(days=1)
+        ev["expected_units"] = exp_sum
+        ev["actual_units"]   = act_sum
+
+anomaly_schema = StructType([
+    StructField("anomaly_id",     StringType(),    False),
+    StructField("sku_id",         StringType(),    False),
+    StructField("dc_id",          StringType(),    False),
+    StructField("start_date",     DateType(),      False),
+    StructField("end_date",       DateType(),      False),
+    StructField("duration_days",  IntegerType(),   True),
+    StructField("direction",      StringType(),    True),
+    StructField("multiplier",     DoubleType(),    True),
+    StructField("reason",         StringType(),    True),
+    StructField("description",    StringType(),    True),
+    StructField("expected_units", IntegerType(),   True),
+    StructField("actual_units",   IntegerType(),   True),
+    StructField("created_at",     TimestampType(), True),
+])
+_anomaly_tuples = [(
+    e["anomaly_id"], e["sku_id"], e["dc_id"], e["start_date"], e["end_date"],
+    int(e["duration_days"]), e["direction"], float(e["multiplier"]),
+    e["reason"], e["description"],
+    int(e["expected_units"]), int(e["actual_units"]), e["created_at"],
+) for e in anomaly_events]
+
+spark.sql(f"DROP TABLE IF EXISTS {SCHEMA}.demand_anomalies")
+spark.createDataFrame(_anomaly_tuples, schema=anomaly_schema) \
+     .write.saveAsTable(f"{SCHEMA}.demand_anomalies")
+
+add_table_metadata(
+    "demand_anomalies",
+    "Explainable demand shocks in the history window. Each row is one event "
+    "for a single (DC, SKU) over a short date range; the multiplier was "
+    "applied to demand_forecast.actual_units inside that window. Use this "
+    "table to attribute forecast-accuracy misses to a named reason.",
+    {
+        "anomaly_id": "Surrogate UUID primary key for this anomaly event.",
+        "sku_id": "Affected SKU; FK to product_master.",
+        "dc_id": "Affected distribution center; FK to distribution_centers.",
+        "start_date": "First day of the anomaly window (inclusive).",
+        "end_date": "Last day of the anomaly window (inclusive).",
+        "duration_days": "Length of the anomaly window in days.",
+        "direction": "SPIKE (actuals > expected) or DROP (actuals < expected).",
+        "multiplier": "Factor applied to baseline actual_units inside the window.",
+        "reason": "Categorical reason code (SEASONAL_SURGE, SUPPLY_DISRUPTION, etc.).",
+        "description": "Human-readable explanation of the reason.",
+        "expected_units": "Sum of demand_forecast.demand_units over the event window.",
+        "actual_units": "Sum of demand_forecast.actual_units over the event window (post-anomaly).",
+        "created_at": "Row creation timestamp.",
+    },
+)
+add_constraints(
+    "demand_anomalies",
+    ["anomaly_id"],
+    fks=[
+        ("fk_demand_anomalies_dc",  ["dc_id"],  "distribution_centers", ["dc_id"]),
+        ("fk_demand_anomalies_sku", ["sku_id"], "product_master",       ["sku_id"]),
+    ],
+)
+
+print(f"  ✓ demand_anomalies: {len(anomaly_events)} rows")
+
+# COMMAND ----------
+
 # DBTITLE 1,inventory_levels
 # On-hand inventory is sized as `days_of_supply × avg_daily_demand` for each
 # (DC, SKU). This gives a realistic position that bridges to the next inbound
@@ -460,7 +626,8 @@ print(f"  ✓ demand_forecast: {len(demand_rows)} rows "
 # random + rescale approach caused per-SKU stockouts that the LP couldn't
 # fulfill, forcing inventory to accumulate later from continuing inbound.
 inv_cfg = SD["inventory"]
-snapshot_date = _to_date(inv_cfg["snapshot_date"])
+# snapshot_date sits the day before start_date so on-hand levels feed today's plan.
+snapshot_date = start_date - timedelta(days=1)
 
 # Sum only forward-looking demand — inventory and inbound sizing target the
 # planning horizon (n_periods days), not the history window.
@@ -851,12 +1018,16 @@ out_delay_rng = out_act_cfg.get("delay_days_rng", {"min": 1, "max": 3})
 out_fill_rng = out_act_cfg.get("fill_rate_rng", {"min": 0.95, "max": 1.03})
 
 outbound_rows = []
+# Outbound shipments scale with the same per-SKU annual growth as demand —
+# sampled fresh here so outbound's randomness is independent of demand's.
 for dc in dc_ids:
     for sku in sku_ids:
         prod = products_by_sku[sku]
+        sku_growth = float(runif(growth_rng))
         for d in all_dates:
             if np.random.random() < out_cfg["probability_per_sku_day"]:
-                units = int(rint(out_cfg["units"]))
+                growth_factor = (1.0 + sku_growth) ** ((d - history_start).days / 365.0)
+                units = int(rint(out_cfg["units"]) * growth_factor)
                 cases = units // prod["units_per_case"]
                 pallets = cases / prod["cases_per_pallet"]
                 is_history = d < start_date
