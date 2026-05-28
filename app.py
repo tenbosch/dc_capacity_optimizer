@@ -7,6 +7,7 @@ import plotly.graph_objects as go
 import pulp
 import streamlit as st
 from databricks import sql
+from databricks.sdk import WorkspaceClient
 from databricks.sdk.core import Config
 
 # =============================================================================
@@ -24,6 +25,7 @@ PSLIDERS = APP_CFG["penalty_sliders"]
 CMULTS = APP_CFG["capacity_multipliers"]
 FACILITY_FILTER = CONFIG["synthetic_data"]["distribution_centers"]["facility_type"]
 SOLVER_PREFERENCE = OPT.get("solver_preference", ["cbc"])
+GENIE_SPACE_ID = os.getenv("DATABRICKS_GENIE_SPACE_ID")
 
 # =============================================================================
 # PAGE CONFIG
@@ -496,6 +498,104 @@ def render_about():
     # ### Data sources
     # All input data lives in the `{SCHEMA}` schema.
     # """)
+
+
+# =============================================================================
+# ASK AI (Genie-backed chat dialog)
+# =============================================================================
+# Uses @st.dialog (not st.popover) because popovers close on rerun, which makes
+# the chat unusable after the first question. The dialog survives reruns from
+# st.chat_input and keeps the conversation pinned open until the user closes it.
+def _render_ask_ai_message(role, content, sql_text=None, df=None):
+    with st.chat_message(role):
+        if content:
+            st.markdown(content)
+        if sql_text:
+            with st.expander("Generated SQL"):
+                st.code(sql_text, language="sql")
+        if df is not None and not df.empty:
+            st.dataframe(df, use_container_width=True, hide_index=True)
+
+
+def _ask_genie(prompt):
+    """Send a question to the Genie space; returns (text, sql, dataframe)."""
+    w = WorkspaceClient()
+    conv_id = st.session_state.get("ask_ai_conv_id")
+    if conv_id is None:
+        result = w.genie.start_conversation_and_wait(GENIE_SPACE_ID, prompt)
+        st.session_state["ask_ai_conv_id"] = result.conversation_id
+    else:
+        result = w.genie.create_message_and_wait(GENIE_SPACE_ID, conv_id, prompt)
+
+    text_parts = []
+    sql_text = None
+    df = None
+    for att in (result.attachments or []):
+        if getattr(att, "text", None) and getattr(att.text, "content", None):
+            text_parts.append(att.text.content)
+        if getattr(att, "query", None) and getattr(att.query, "query", None):
+            sql_text = att.query.query
+            try:
+                qr = w.genie.get_message_query_result(
+                    GENIE_SPACE_ID, result.conversation_id, result.id,
+                )
+                data_arr = qr.statement_response.result.data_array or []
+                cols = [c.name for c in qr.statement_response.manifest.schema.columns]
+                df = pd.DataFrame(data_arr, columns=cols)
+            except Exception:
+                df = None
+    return ("\n\n".join(text_parts) or "_(no text response)_"), sql_text, df
+
+
+@st.dialog("\U0001f4ac Ask AI", width="large")
+def _ask_ai_dialog():
+    if st.button("Start new conversation", key="ask_ai_reset"):
+        st.session_state["ask_ai_messages"] = []
+        st.session_state["ask_ai_conv_id"] = None
+        st.rerun()
+
+    messages = st.session_state.setdefault("ask_ai_messages", [])
+
+    # Container placeholder reserves the slot ABOVE chat_input so the input
+    # always renders at the bottom of the dialog, regardless of how many
+    # messages get appended during this run.
+    msg_area = st.container()
+    prompt = st.chat_input("Ask about DCs, demand, inventory, …")
+
+    with msg_area:
+        for m in messages:
+            _render_ask_ai_message(
+                m["role"], m.get("content"),
+                sql_text=m.get("sql"), df=m.get("df"),
+            )
+
+        if prompt:
+            messages.append({"role": "user", "content": prompt})
+            _render_ask_ai_message("user", prompt)
+            with st.chat_message("assistant"):
+                with st.spinner("Asking Genie…"):
+                    try:
+                        text, sql_text, df = _ask_genie(prompt)
+                    except Exception as e:
+                        text, sql_text, df = f"⚠️ Genie error: {e}", None, None
+                if text:
+                    st.markdown(text)
+                if sql_text:
+                    with st.expander("Generated SQL"):
+                        st.code(sql_text, language="sql")
+                if df is not None and not df.empty:
+                    st.dataframe(df, use_container_width=True, hide_index=True)
+            messages.append({
+                "role": "assistant", "content": text,
+                "sql": sql_text, "df": df,
+            })
+
+
+def render_ask_ai():
+    if not GENIE_SPACE_ID:
+        return
+    if st.button("\U0001f4ac Ask AI", use_container_width=True, key="ask_ai_open"):
+        _ask_ai_dialog()
 
 
 # =============================================================================
@@ -1430,6 +1530,113 @@ def category_or_sku(df, selected_category, sum_cols=(), wavg_cols=(), risk_col=N
 
 
 # =============================================================================
+# INVENTORY DETAIL PIVOT FORMATTING
+# =============================================================================
+# Display label for the raw storage_type values stored in product_master.
+_STORAGE_LABEL = {"AMBIENT": "Ambient", "COLD": "Cold"}
+
+# Number formats shared by the inventory pivot (rollup) and the SKU drill table.
+_INV_NUM_FORMATS = {
+    "On-Hand Units": "{:,.0f}",
+    "Available Units": "{:,.0f}",
+    "Allocated Units": "{:,.0f}",
+    "Days of Supply": "{:,.1f}",
+    "Cube (cu ft)": "{:,.1f}",
+    "Inventory Value ($)": "${:,.0f}",
+    "Daily Holding Cost ($)": "${:,.2f}",
+}
+
+
+# Inventory pivot columns: (header, source column, format string).
+_INV_PIVOT_COLS = [
+    ("On-Hand Units", "on_hand_units", "{:,.0f}"),
+    ("Available Units", "available_units", "{:,.0f}"),
+    ("Allocated Units", "allocated_units", "{:,.0f}"),
+    ("Days of Supply", "days_of_supply", "{:,.1f}"),
+    ("Cube (cu ft)", "total_cube_ft3", "{:,.1f}"),
+    ("Inventory Value ($)", "inventory_value", "${:,.0f}"),
+    ("Daily Holding Cost ($)", "daily_holding_cost", "${:,.2f}"),
+]
+_INV_PIVOT_SUM_COLS = [
+    "on_hand_units", "available_units", "allocated_units",
+    "total_cube_ft3", "inventory_value", "daily_holding_cost",
+    "total_demand_units",
+]
+
+
+def _inv_pivot_html(inv_split, n_periods):
+    """Render the category × storage-type inventory rollup as a real pivot
+    table (HTML): the category name is a merged cell (rowspan) spanning its
+    Ambient/Cold rows and a bold Subtotal, closed by a bold Grand Total.
+    `inv_split` is a per-(product_category, storage_type) aggregate with the
+    columns in `_INV_PIVOT_SUM_COLS`; `storage_type` is already display-labelled.
+    Inline styles only — Streamlit strips pandas Styler <style> blocks."""
+    def dos(on_hand, demand):
+        return on_hand / max(demand / n_periods, 1)
+
+    th = ("padding:6px 12px;text-align:right;border-bottom:2px solid #b9bcc4;"
+          "font-weight:600;color:#31333f;white-space:nowrap;")
+    th_left = th.replace("text-align:right", "text-align:left")
+    td = ("padding:6px 12px;text-align:right;border-bottom:1px solid #ededf0;"
+          "white-space:nowrap;")
+    td_left = td.replace("text-align:right", "text-align:left")
+    cat_border = "border-top:2px solid #d6d8de;"
+
+    out = ['<table style="border-collapse:collapse;width:100%;'
+           'font-size:0.86rem;font-variant-numeric:tabular-nums;">']
+    out.append("<thead><tr>")
+    out.append(f'<th style="{th_left}">Category</th>')
+    out.append(f'<th style="{th_left}">Storage Type</th>')
+    for header, _, _ in _INV_PIVOT_COLS:
+        out.append(f'<th style="{th}">{header}</th>')
+    out.append("</tr></thead><tbody>")
+
+    grand = {c: 0.0 for c in _INV_PIVOT_SUM_COLS}
+
+    for category in sorted(inv_split["product_category"].unique()):
+        rows = inv_split[inv_split["product_category"] == category].sort_values(
+            "storage_type"
+        )
+        records = rows.to_dict("records")
+        subtotal = {c: float(rows[c].sum()) for c in _INV_PIVOT_SUM_COLS}
+
+        for i, rec in enumerate(records):
+            bt = cat_border if i == 0 else ""
+            out.append("<tr>")
+            if i == 0:
+                out.append(
+                    f'<td rowspan="{len(records) + 1}" style="{td_left}'
+                    f'font-weight:600;vertical-align:middle;{bt}">{category}</td>'
+                )
+            out.append(f'<td style="{td_left}{bt}">{rec["storage_type"]}</td>')
+            rec["days_of_supply"] = dos(rec["on_hand_units"], rec["total_demand_units"])
+            for _, col, fmt in _INV_PIVOT_COLS:
+                out.append(f'<td style="{td}{bt}">{fmt.format(rec[col])}</td>')
+            out.append("</tr>")
+
+        subtotal["days_of_supply"] = dos(
+            subtotal["on_hand_units"], subtotal["total_demand_units"]
+        )
+        out.append('<tr style="background:#f0f2f6;font-weight:600;">')
+        out.append(f'<td style="{td_left}">Subtotal</td>')
+        for _, col, fmt in _INV_PIVOT_COLS:
+            out.append(f'<td style="{td}">{fmt.format(subtotal[col])}</td>')
+        out.append("</tr>")
+
+        for c in _INV_PIVOT_SUM_COLS:
+            grand[c] += subtotal[c]
+
+    grand["days_of_supply"] = dos(grand["on_hand_units"], grand["total_demand_units"])
+    out.append('<tr style="background:#e4e7ef;font-weight:700;'
+               'border-top:2px solid #b9bcc4;">')
+    out.append(f'<td colspan="2" style="{td_left}">Grand Total</td>')
+    for _, col, fmt in _INV_PIVOT_COLS:
+        out.append(f'<td style="{td}">{fmt.format(grand[col])}</td>')
+    out.append("</tr></tbody></table>")
+    return "".join(out)
+
+
+# =============================================================================
 # FORECAST ACCURACY + VARIANCE DRIVERS (per-DC, inside detail view)
 # =============================================================================
 def _render_dc_accuracy_section(dc_id, df_products, selected_category):
@@ -1919,44 +2126,47 @@ def render_detail(dc_id, df_summary):
         )
 
     with st.expander("\U0001f4cb Inventory detail table", expanded=False):
-        st.caption(
-            "Per-group on-hand, available, allocated, days-of-supply, cube, "
-            "inventory value, and daily holding cost — split by storage type "
-            "(Ambient vs. Cold). Categories with SKUs in only one storage class "
-            "show a single row. "
-            "Value = on_hand_units × revenue_per_unit; "
-            "holding cost = on_hand_units × holding_cost_per_unit_per_day."
-        )
         if selected_category is None:
-            agg_cols = [
-                "on_hand_units", "available_units", "allocated_units",
-                "total_cube_ft3", "inventory_value", "daily_holding_cost",
-                "total_demand_units",
-            ]
+            st.caption(
+                "Pivot of on-hand, available, allocated, days-of-supply, cube, "
+                "inventory value, and daily holding cost — storage type "
+                "(Ambient vs. Cold) nested under each category, with a bold "
+                "Subtotal row per category and a bold Grand Total. Categories "
+                "with SKUs in only one storage class show a single storage row. "
+                "Value = on_hand_units × revenue_per_unit; "
+                "holding cost = on_hand_units × holding_cost_per_unit_per_day; "
+                "days of supply on aggregate rows = summed on-hand ÷ avg daily demand."
+            )
+        else:
+            st.caption(
+                "Per-SKU on-hand, available, allocated, days-of-supply, cube, "
+                "inventory value, and daily holding cost for the selected "
+                "category, with each SKU's storage type (Ambient vs. Cold). "
+                "Value = on_hand_units × revenue_per_unit; "
+                "holding cost = on_hand_units × holding_cost_per_unit_per_day."
+            )
+
+        if selected_category is None:
             inv_split = (
                 df_inv_enriched
-                .groupby(["product_category", "storage_type"], as_index=False)[agg_cols]
+                .groupby(["product_category", "storage_type"], as_index=False)[
+                    _INV_PIVOT_SUM_COLS
+                ]
                 .sum()
             )
-            inv_split["days_of_supply"] = inv_split.apply(
-                lambda r: r["on_hand_units"] / max(r["total_demand_units"] / n_periods, 1),
-                axis=1,
+            inv_split["storage_type"] = (
+                inv_split["storage_type"].map(_STORAGE_LABEL)
+                .fillna(inv_split["storage_type"])
             )
-            inv_display = inv_split[[
-                "product_category", "storage_type",
-                "on_hand_units", "available_units", "allocated_units",
-                "days_of_supply", "total_cube_ft3", "inventory_value", "daily_holding_cost",
-            ]].copy()
-            inv_display.columns = [
-                "Category", "Storage Type", "On-Hand Units", "Available Units",
-                "Allocated Units", "Days of Supply", "Cube (cu ft)",
-                "Inventory Value ($)", "Daily Holding Cost ($)",
-            ]
-            inv_display = inv_display.sort_values(["Category", "Storage Type"])
+            st.markdown(_inv_pivot_html(inv_split, n_periods), unsafe_allow_html=True)
         else:
             df_drill = df_inv_enriched[
                 df_inv_enriched["product_category"] == selected_category
-            ]
+            ].copy()
+            df_drill["storage_type"] = (
+                df_drill["storage_type"].map(_STORAGE_LABEL)
+                .fillna(df_drill["storage_type"])
+            )
             inv_display = df_drill[[
                 "sku_id", "storage_type", "on_hand_units", "available_units",
                 "allocated_units", "days_of_supply", "total_cube_ft3",
@@ -1968,12 +2178,8 @@ def render_detail(dc_id, df_summary):
                 "Inventory Value ($)", "Daily Holding Cost ($)",
             ]
             inv_display = inv_display.sort_values(["Storage Type", "SKU"])
-
-        inv_display["Days of Supply"] = inv_display["Days of Supply"].round(1)
-        inv_display["Cube (cu ft)"] = inv_display["Cube (cu ft)"].round(1)
-        inv_display["Inventory Value ($)"] = inv_display["Inventory Value ($)"].round(2)
-        inv_display["Daily Holding Cost ($)"] = inv_display["Daily Holding Cost ($)"].round(2)
-        st.dataframe(inv_display, use_container_width=True, hide_index=True)
+            styler = inv_display.style.format(_INV_NUM_FORMATS)
+            st.dataframe(styler, use_container_width=True, hide_index=True)
 
     # --- Demand vs Coverage ---
     st.markdown("---")
@@ -2686,17 +2892,25 @@ _selected_dc = st.session_state.get("selected_dc")
 _on_detail = (_view == "accuracy") or (_view != "map" and _selected_dc)
 
 if _on_detail:
-    _title_col, _back_col = st.columns([5, 1])
+    _title_col, _ask_col, _back_col = st.columns([5, 1, 1])
     with _title_col:
         st.title("\U0001f3ed DC Capacity Tool")
+    with _ask_col:
+        st.write("")  # vertical nudge so the trigger aligns with the title
+        render_ask_ai()
     with _back_col:
-        st.write("")  # vertical nudge so the button visually aligns with the title
+        st.write("")
         if st.button("← Back to map", use_container_width=True, key="top_back"):
             st.session_state["view"] = "map"
             st.session_state["selected_dc"] = None
             st.rerun()
 else:
-    st.title("\U0001f3ed DC Capacity Tool")
+    _title_col, _ask_col = st.columns([6, 1])
+    with _title_col:
+        st.title("\U0001f3ed DC Capacity Tool")
+    with _ask_col:
+        st.write("")
+        render_ask_ai()
 
 st.markdown("Interactive scenario planning with penalty-based soft constraints.")
 
