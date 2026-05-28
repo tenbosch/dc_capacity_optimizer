@@ -464,68 +464,47 @@ def load_transport_actuals(dc_id):
 
 
 # =============================================================================
-# CONNECTION DIAGNOSTICS (rendered once at top)
-# =============================================================================
-def render_diagnostics():
-    with st.expander("⚙️ Connection diagnostics", expanded=False):
-        warehouse_id = os.getenv("DATABRICKS_WAREHOUSE_ID")
-        if warehouse_id:
-            st.success(f"Warehouse ID: `{warehouse_id}`")
-        else:
-            st.error(
-                "DATABRICKS_WAREHOUSE_ID is **not set**. "
-                "Configure the SQL warehouse resource in app.yaml."
-            )
-            st.stop()
-        try:
-            _cfg = Config()
-            st.success(f"Host: `{_cfg.host}`")
-        except Exception as e:
-            st.error(f"SDK Config error: {e}")
-            st.stop()
-        st.info(f"Schema: `{SCHEMA}`")
-
-
-# =============================================================================
 # ABOUT
 # =============================================================================
 def render_about():
-    with st.expander("ℹ️ About this app", expanded=False):
-        st.markdown(f"""
-        ### What does this app do?
+    st.markdown(f"""
+    ### What does this app do?
 
-        Models a pharma distribution network with two tiers. The landing
-        page shows every facility on a map:
+    Models a pharma distribution network with two tiers. The landing
+    page shows every facility on a map:
 
-        * **Wholesale DCs** (green/red circles) — storage + outbound nodes;
-          click a pin to drill into per-DC inventory and run the LP optimizer.
-        * **National DCs / NDCs** (dark-blue diamonds) — 24-hour cross-dock
-          hubs that receive product from pharma manufacturers and dispatch
-          it onward to Wholesale DCs. Click a pin to open the NDC throughput
-          simulation with interactive what-if controls.
+    * **Wholesale DCs** (green/red circles) — storage + outbound nodes;
+      click a pin to drill into per-DC inventory and run the LP optimizer.
+    * **National DCs / NDCs** (dark-blue diamonds) — 24-hour cross-dock
+      hubs that receive product from pharma manufacturers and dispatch
+      it onward to Wholesale DCs. Click a pin to open the NDC throughput
+      simulation with interactive what-if controls.
+    """)
+    # ### Where does the DC list come from?
 
-        ### Where does the DC list come from?
+    # `{SCHEMA}.distribution_centers` filtered to
+    # `facility_type = '{FACILITY_FILTER}'`, inner-joined with
+    # `{SCHEMA}.dc_capacity` so only DCs with both metadata and capacity data
+    # are selectable.
 
-        `{SCHEMA}.distribution_centers` filtered to
-        `facility_type = '{FACILITY_FILTER}'`, inner-joined with
-        `{SCHEMA}.dc_capacity` so only DCs with both metadata and capacity data
-        are selectable.
+    # ### Solver
 
-        ### Solver
+    # Prefers **HiGHS** (`highspy`) and falls back to **CBC** if HiGHS is not
+    # installed. Configurable via `optimization.solver_preference` in
+    # `config.yaml`.
 
-        Prefers **HiGHS** (`highspy`) and falls back to **CBC** if HiGHS is not
-        installed. Configurable via `optimization.solver_preference` in
-        `config.yaml`.
-
-        ### Data sources
-        All input data lives in the `{SCHEMA}` schema.
-        """)
+    # ### Data sources
+    # All input data lives in the `{SCHEMA}` schema.
+    # """)
 
 
 # =============================================================================
 # MAP VIEW
 # =============================================================================
 def render_map(df_summary, df_ndc_summary=None):
+    render_about()
+    st.divider()
+
     st.markdown("### \U0001f5fa️ Distribution Center Network")
     st.caption(
         "Green/red circles = Wholesale DCs (color = worst-of ambient/cold storage "
@@ -787,13 +766,6 @@ def simulate_ndc_dispatch(df_inbound_day, capacity_per_hour, vol_mult=1.0,
 # NETWORK-LEVEL FORECAST ACCURACY VIEW
 # =============================================================================
 def render_accuracy_network(df_summary):
-    top = st.columns([1, 4])
-    with top[0]:
-        if st.button("← Back to map", use_container_width=True, key="acc_back"):
-            st.session_state["view"] = "map"
-            st.session_state["selected_dc"] = None
-            st.rerun()
-
     st.markdown("### \U0001f4ca Network Forecast Accuracy")
     st.caption(
         "Weighted forecast-vs-actuals over the historical window. MAPE is the "
@@ -839,6 +811,11 @@ def render_accuracy_network(df_summary):
 
     st.markdown("---")
     st.markdown("#### Daily MAPE trend")
+    st.caption(
+        "Daily forecast error vs. delivered demand across the network. "
+        "MAPE = mean(|forecast − actual| / actual). "
+        "Bias % = mean((forecast − actual) / actual) — positive = over-forecast."
+    )
     fig_trend = go.Figure()
     fig_trend.add_trace(go.Scatter(
         x=df_daily["forecast_date"],
@@ -865,6 +842,10 @@ def render_accuracy_network(df_summary):
 
     st.markdown("---")
     st.markdown("#### DC ranking — MAPE (worst at top)")
+    st.caption(
+        "DCs ordered worst-to-best by MAPE; bar color shows bias % "
+        "(red = systematic over-forecast, blue = under-forecast)."
+    )
     df_rank = df_dc.sort_values("mape", ascending=False).copy()
     df_rank["mape_pct"] = df_rank["mape"] * 100
     df_rank["bias_pct_display"] = df_rank["bias_pct"] * 100
@@ -916,12 +897,7 @@ def render_accuracy_network(df_summary):
 # NDC DETAIL VIEW
 # =============================================================================
 def render_ndc_detail(dc_id):
-    top = st.columns([1, 4])
-    with top[0]:
-        if st.button("← Back to map", use_container_width=True, key="ndc_back"):
-            st.session_state["view"] = "map"
-            st.session_state["selected_dc"] = None
-            st.rerun()
+    header_placeholder = st.empty()
 
     with st.status(f"Loading NDC data for {dc_id}...", expanded=False) as status:
         try:
@@ -953,7 +929,7 @@ def render_ndc_detail(dc_id):
     sla_hours = float(cap_row["sla_dwell_hours"])
     base_capacity = int(cap_row["max_hourly_throughput_pallets"])
 
-    with top[1]:
+    with header_placeholder.container():
         st.markdown(
             f"## \U0001f3ed {dc_id} — {facility_name} (NDC)\n"
             f"**{meta['city']}, {meta['state_code']}** · {sla_hours:.0f}h cross-dock · "
@@ -1033,6 +1009,11 @@ def render_ndc_detail(dc_id):
 
     # Hourly flow
     st.subheader(f"\U0001f4ca Hourly Flow — {selected_day}")
+    st.caption(
+        "Inbound vs. outbound pallets per hour, with end-of-hour queue depth (line). "
+        "Driven by the dispatch simulator using your sidebar what-if settings; "
+        "dashed line = configured hourly capacity."
+    )
     hours = list(range(24))
     fig_flow = go.Figure()
     fig_flow.add_trace(go.Bar(
@@ -1060,6 +1041,10 @@ def render_ndc_detail(dc_id):
     # Sankey: pharma -> NDC -> WDC
     if not df_out.empty:
         st.subheader("\U0001f504 Pharma → NDC → Wholesale DCs")
+        st.caption(
+            "Pallet flow on the selected day: pharma suppliers (left) into this NDC "
+            "and back out to Wholesale DCs (right). Width = pallet volume."
+        )
         df_inb_day_for_sankey = df_inb[df_inb["arrival_date"] == selected_day]
         df_out_day = df_out[df_out["departure_date"] == selected_day]
 
@@ -1120,6 +1105,10 @@ def render_ndc_detail(dc_id):
     # Dwell histogram
     if len(sim["dwell_hours"]) > 0:
         st.subheader("⏱️ Dwell Time Distribution")
+        st.caption(
+            "Per-pallet dwell from receipt to dispatch, computed by the simulator. "
+            "Dashed line = configured cross-dock SLA hours."
+        )
         fig_hist = go.Figure()
         fig_hist.add_trace(go.Histogram(
             x=sim["dwell_hours"], nbinsx=24, marker_color="#636EFA",
@@ -1136,6 +1125,10 @@ def render_ndc_detail(dc_id):
         st.plotly_chart(fig_hist, use_container_width=True)
 
     with st.expander("\U0001f4cb Daily breakdown table", expanded=False):
+        st.caption(
+            "Per-day inbound and outbound pallets, average dwell hours, "
+            "and % of pallets within SLA (computed by the simulator)."
+        )
         per_day_in = (
             df_inb.groupby("arrival_date")["inbound_pallets"].sum().reset_index()
             .rename(columns={"inbound_pallets": "inbound"})
@@ -1497,6 +1490,10 @@ def _render_dc_accuracy_section(dc_id, df_products, selected_category):
 
         # Forecast vs Actual grouped bar
         st.markdown("##### Forecast vs Actual")
+        st.caption(
+            "Forecast vs. delivered units for the history window, grouped by category "
+            "(or by SKU when a category is selected in the sidebar)."
+        )
         fig_fa = go.Figure()
         fig_fa.add_trace(go.Bar(
             x=df_view["group_label"], y=df_view["forecast_units"],
@@ -1518,6 +1515,10 @@ def _render_dc_accuracy_section(dc_id, df_products, selected_category):
 
         # Bias % diverging bar
         st.markdown("##### Bias % (positive = over-forecast)")
+        st.caption(
+            "Bias = (forecast − actual) / actual, demand-weighted. "
+            "Red = systematic over-forecast, blue = under-forecast."
+        )
         fig_bias = px.bar(
             df_view.sort_values("bias_pct"),
             x="bias_pct", y="group_label",
@@ -1538,6 +1539,10 @@ def _render_dc_accuracy_section(dc_id, df_products, selected_category):
         # SKU × week MAPE heatmap (only in drill mode where there are few SKUs)
         if selected_category is not None:
             st.markdown("##### Weekly MAPE heatmap (SKU × week)")
+            st.caption(
+                "Per-SKU weekly MAPE across the history window. "
+                "Darker red = larger forecast error that week."
+            )
             df_acc["forecast_date"] = pd.to_datetime(df_acc["forecast_date"])
             df_acc["week"] = df_acc["forecast_date"].dt.to_period("W").dt.start_time
             heat = (
@@ -1572,6 +1577,10 @@ def _render_dc_accuracy_section(dc_id, df_products, selected_category):
 
         # --- D1: Demand shifts ---
         with tab_demand:
+            st.caption(
+                "Week-over-week % delta of (actual − forecast) / forecast by category. "
+                "Highlights weeks where actuals diverged most from plan."
+            )
             df_acc["forecast_date"] = pd.to_datetime(df_acc["forecast_date"])
             df_acc["week"] = df_acc["forecast_date"].dt.to_period("W").dt.start_time
             wow = (
@@ -1600,6 +1609,10 @@ def _render_dc_accuracy_section(dc_id, df_products, selected_category):
             )
             top_off["mape"] = (top_off["mape"] * 100).round(1).astype(str) + "%"
             st.markdown("**Top 10 SKUs by absolute forecast error**")
+            st.caption(
+                "SKUs contributing the most error in unit terms, "
+                "ranked by Σ|forecast − actual| across the history window."
+            )
             st.dataframe(
                 top_off[["sku_id", "product_category", "actual_units", "abs_error_units", "mape"]],
                 use_container_width=True, hide_index=True,
@@ -1627,6 +1640,10 @@ def _render_dc_accuracy_section(dc_id, df_products, selected_category):
                 for c in ("on_hand_units", "days_of_supply"):
                     df_inv[c] = pd.to_numeric(df_inv[c], errors="coerce").fillna(0)
                 st.markdown("**Bottom 15 SKUs by days-of-supply**")
+                st.caption(
+                    "SKUs at greatest inventory risk. "
+                    "DoS = on_hand_units / average daily forecasted demand."
+                )
                 st.dataframe(df_inv, use_container_width=True, hide_index=True)
 
         # --- D3: Transportation drivers ---
@@ -1642,6 +1659,10 @@ def _render_dc_accuracy_section(dc_id, df_products, selected_category):
                     "data generator to populate inbound/outbound actuals."
                 )
             else:
+                st.caption(
+                    "Carrier on-time performance from inbound/outbound history. "
+                    "On-time = `delay_days ≤ 0`; dashed line on the chart marks the 90% target."
+                )
                 inb = df_tx[df_tx["direction"] == "inbound"]
                 out = df_tx[df_tx["direction"] == "outbound"]
                 k1, k2, k3, k4 = st.columns(4)
@@ -1681,13 +1702,7 @@ def _render_dc_accuracy_section(dc_id, df_products, selected_category):
 # DETAIL VIEW
 # =============================================================================
 def render_detail(dc_id, df_summary):
-    # Back button + header
-    top = st.columns([1, 4])
-    with top[0]:
-        if st.button("← Back to map", use_container_width=True):
-            st.session_state["view"] = "map"
-            st.session_state["selected_dc"] = None
-            st.rerun()
+    header_placeholder = st.empty()
 
     # Load DC-scoped data (cached per dc_id)
     with st.status(f"Loading data for {dc_id}...", expanded=False) as status:
@@ -1730,7 +1745,7 @@ def render_detail(dc_id, df_summary):
     state_code = dc_meta.get("state_code", "")
     region = dc_meta.get("region", "")
 
-    with top[1]:
+    with header_placeholder.container():
         st.markdown(
             f"## \U0001f3ed {dc_id} — {facility_name}\n"
             f"**{city}, {state_code}** · {region} · "
@@ -1816,6 +1831,10 @@ def render_detail(dc_id, df_summary):
     inv_col5.metric("Daily Holding Cost", f"${df_inv_enriched['daily_holding_cost'].sum():,.0f}")
 
     # Side-by-side capacity-vs-current bar for each storage type.
+    st.caption(
+        "Cube ft used vs. available, split by ambient and cold storage. "
+        "Used cube = Σ(on_hand_units × unit_cube_ft3) within each storage class."
+    )
     storage_df = pd.DataFrame({
         "Type": ["Ambient", "Cold"],
         "Used (cu ft)":    [amb_cube, cold_cube],
@@ -1871,6 +1890,11 @@ def render_detail(dc_id, df_summary):
         )
         fig_inv_units.update_layout(height=350)
         st.plotly_chart(fig_inv_units, use_container_width=True)
+        st.caption(
+            "Units on-hand by category (or SKU when drilled in), "
+            "color-graded by days-of-supply (red = low coverage). "
+            "DoS = on_hand_units / average daily forecasted demand."
+        )
 
     with inv_right:
         fig_cube = px.bar(
@@ -1889,16 +1913,62 @@ def render_detail(dc_id, df_summary):
             )
         fig_cube.update_layout(height=350)
         st.plotly_chart(fig_cube, use_container_width=True)
+        st.caption(
+            "Physical cube ft consumed per group, computed as "
+            "Σ(on_hand_units × unit_cube_ft3). Red line = average capacity share per group."
+        )
 
     with st.expander("\U0001f4cb Inventory detail table", expanded=False):
-        inv_display = df_inv_view[[
-            "group_label", "on_hand_units", "available_units", "allocated_units",
-            "days_of_supply", "total_cube_ft3", "inventory_value", "daily_holding_cost",
-        ]].copy()
-        inv_display.columns = [
-            group_axis_label, "On-Hand Units", "Available Units", "Allocated Units",
-            "Days of Supply", "Cube (cu ft)", "Inventory Value ($)", "Daily Holding Cost ($)",
-        ]
+        st.caption(
+            "Per-group on-hand, available, allocated, days-of-supply, cube, "
+            "inventory value, and daily holding cost — split by storage type "
+            "(Ambient vs. Cold). Categories with SKUs in only one storage class "
+            "show a single row. "
+            "Value = on_hand_units × revenue_per_unit; "
+            "holding cost = on_hand_units × holding_cost_per_unit_per_day."
+        )
+        if selected_category is None:
+            agg_cols = [
+                "on_hand_units", "available_units", "allocated_units",
+                "total_cube_ft3", "inventory_value", "daily_holding_cost",
+                "total_demand_units",
+            ]
+            inv_split = (
+                df_inv_enriched
+                .groupby(["product_category", "storage_type"], as_index=False)[agg_cols]
+                .sum()
+            )
+            inv_split["days_of_supply"] = inv_split.apply(
+                lambda r: r["on_hand_units"] / max(r["total_demand_units"] / n_periods, 1),
+                axis=1,
+            )
+            inv_display = inv_split[[
+                "product_category", "storage_type",
+                "on_hand_units", "available_units", "allocated_units",
+                "days_of_supply", "total_cube_ft3", "inventory_value", "daily_holding_cost",
+            ]].copy()
+            inv_display.columns = [
+                "Category", "Storage Type", "On-Hand Units", "Available Units",
+                "Allocated Units", "Days of Supply", "Cube (cu ft)",
+                "Inventory Value ($)", "Daily Holding Cost ($)",
+            ]
+            inv_display = inv_display.sort_values(["Category", "Storage Type"])
+        else:
+            df_drill = df_inv_enriched[
+                df_inv_enriched["product_category"] == selected_category
+            ]
+            inv_display = df_drill[[
+                "sku_id", "storage_type", "on_hand_units", "available_units",
+                "allocated_units", "days_of_supply", "total_cube_ft3",
+                "inventory_value", "daily_holding_cost",
+            ]].copy()
+            inv_display.columns = [
+                "SKU", "Storage Type", "On-Hand Units", "Available Units",
+                "Allocated Units", "Days of Supply", "Cube (cu ft)",
+                "Inventory Value ($)", "Daily Holding Cost ($)",
+            ]
+            inv_display = inv_display.sort_values(["Storage Type", "SKU"])
+
         inv_display["Days of Supply"] = inv_display["Days of Supply"].round(1)
         inv_display["Cube (cu ft)"] = inv_display["Cube (cu ft)"].round(1)
         inv_display["Inventory Value ($)"] = inv_display["Inventory Value ($)"].round(2)
@@ -1991,6 +2061,11 @@ def render_detail(dc_id, df_summary):
             legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
         )
         st.plotly_chart(fig_cov, use_container_width=True)
+        st.caption(
+            "Per-group on-hand (blue) and scheduled inbound (green) compared "
+            "against total forecasted demand (red) over the planning horizon. "
+            "Bars sorted by coverage ratio (lowest first)."
+        )
 
     with dem_right:
         demand_daily = df_demand.groupby("forecast_date")["demand_units"].sum().reset_index()
@@ -2013,6 +2088,10 @@ def render_detail(dc_id, df_summary):
             xaxis_title="Date", yaxis_title="Units", height=400,
         )
         st.plotly_chart(fig_daily, use_container_width=True)
+        st.caption(
+            "Total forecasted units shipping out of this DC per day, "
+            "summed across all SKUs. Dashed line = average daily supply for reference."
+        )
 
     expander_label = (
         "\U0001f50d Coverage detail by category"
@@ -2047,6 +2126,11 @@ def render_detail(dc_id, df_summary):
                 "Total Demand", "Surplus / Deficit", "Coverage Ratio", "At Risk",
             ]
         cov_display = cov_display.sort_values("Coverage Ratio")
+        st.caption(
+            "Per-group supply (on-hand + inbound) vs. demand. "
+            "Coverage ratio = total_supply / total_demand; "
+            "items below 1.0 are flagged at-risk."
+        )
         st.dataframe(cov_display, use_container_width=True, hide_index=True)
 
     # --- Forecast Accuracy + Variance Drivers ---
@@ -2115,6 +2199,10 @@ def render_detail(dc_id, df_summary):
                 height=400,
             )
             st.plotly_chart(fig_ob, use_container_width=True)
+            st.caption(
+                "Pallets shipped per day from this DC. "
+                "Dashed line = configured outbound dock capacity from `dc_capacity`."
+            )
 
         with ob_right:
             if "carrier_id" in df_ob.columns:
@@ -2132,8 +2220,15 @@ def render_detail(dc_id, df_summary):
                 fig_carrier.update_layout(height=400, showlegend=True,
                                           legend=dict(orientation="h", y=-0.1))
                 st.plotly_chart(fig_carrier, use_container_width=True)
+                st.caption(
+                    "Share of outbound pallets by courier over the planning horizon."
+                )
 
         with st.expander("\U0001f4cb Daily outbound detail", expanded=False):
+            st.caption(
+                "Per-day shipped pallets, units, and order count, plus dock utilization "
+                "(Capacity % = pallets / max_daily_outbound_pallets)."
+            )
             disp = daily_ob.copy()
             disp.columns = ["Ship Date", "Pallets", "Units", "Orders"]
             disp["Pallets"] = disp["Pallets"].round(1)
@@ -2270,6 +2365,10 @@ def render_detail(dc_id, df_summary):
         if enable_comparison and COMP_KEY in st.session_state and st.session_state[COMP_KEY]:
             comp = st.session_state[COMP_KEY]
             st.markdown("### Scenario Comparison")
+            st.caption(
+                "Side-by-side LP outputs for the primary vs. comparison scenario; "
+                "Delta = comparison − primary."
+            )
             comp_df = pd.DataFrame({
                 "Metric": ["Net Profit", "Revenue", "Fill Rate (%)",
                            "Overflow Penalty", "Labor Cost"],
@@ -2374,8 +2473,16 @@ def render_detail(dc_id, df_summary):
                 xaxis_title="Period", yaxis_title="Pallets", height=400,
             )
             st.plotly_chart(fig_ob, use_container_width=True)
+            st.caption(
+                "LP-allocated outbound pallets per period. "
+                "Bars above the dashed dock capacity line are absorbed as outbound overflow penalty."
+            )
 
             st.markdown("**Throughput (units) per day**")
+            st.caption(
+                "Total units processed by this DC per period in the LP solution. "
+                "Dashed line = configured daily throughput capacity."
+            )
             fig_tp = go.Figure()
             fig_tp.add_trace(go.Bar(
                 x=df_ov["period"], y=df_ov["throughput_units"],
@@ -2408,6 +2515,11 @@ def render_detail(dc_id, df_summary):
             )
             fig2.update_layout(height=400)
             st.plotly_chart(fig2, use_container_width=True)
+            st.caption(
+                "Penalty $ from each soft-constraint slack, stacked by constraint type. "
+                "Each unit of slack costs its configured penalty in `config.yaml` "
+                "(also tunable via the sidebar)."
+            )
 
             st.subheader("Physical Overflow Quantities (amounts exceeding capacity)")
             st.caption(
@@ -2455,6 +2567,11 @@ def render_detail(dc_id, df_summary):
             fig3.add_hline(y=95, line_dash="dash", annotation_text="95% Target")
             fig3.update_layout(height=400, yaxis_title="Fill Rate %")
             st.plotly_chart(fig3, use_container_width=True)
+            st.caption(
+                "Fill rate = Σ fulfilled / Σ demand from the LP solution, "
+                "rolled up demand-weighted to category (or per SKU when drilled in). "
+                "Green ≥ 95% target → red < target."
+            )
 
         with tab5:
             fig4 = go.Figure()
@@ -2465,6 +2582,10 @@ def render_detail(dc_id, df_summary):
             fig4.update_layout(title="Labor Hours Allocation",
                                barmode="stack", yaxis_title="Hours", height=400)
             st.plotly_chart(fig4, use_container_width=True)
+            st.caption(
+                "LP-allocated regular hours (green) and overtime hours (orange) per period. "
+                "Overtime kicks in only after regular hours are fully consumed."
+            )
 
         with tab6:
             st.markdown("**Projected Inventory Over Planning Horizon**")
@@ -2483,6 +2604,10 @@ def render_detail(dc_id, df_summary):
                 xaxis_title="Period", yaxis_title="Units", height=350,
             )
             st.plotly_chart(fig_inv_traj, use_container_width=True)
+            st.caption(
+                "Total ending inventory across all SKUs per period in the LP solution. "
+                "Inventory balance: prior + inbound − fulfilled."
+            )
 
             # Inventory heatmap: 7 categories × periods by default; drill into
             # one category to see its ~14 SKUs × periods.
@@ -2509,8 +2634,16 @@ def render_detail(dc_id, df_summary):
             )
             fig_heat.update_layout(height=400)
             st.plotly_chart(fig_heat, use_container_width=True)
+            st.caption(
+                "Per-category (or per-SKU when drilled in) ending inventory units "
+                "across the planning horizon. Darker red = higher inventory."
+            )
 
             st.markdown("**Demand vs. Fulfillment vs. Ending Inventory by Period**")
+            st.caption(
+                "Per-period demand (bar), LP-fulfilled units (bar), and ending inventory (line). "
+                "Gap between demand and fulfilled = unmet demand for that period."
+            )
             period_summary = df_ful.groupby("period").agg(
                 total_demand=("demand", "sum"),
                 total_fulfilled=("fulfilled", "sum"),
@@ -2548,11 +2681,24 @@ def render_detail(dc_id, df_summary):
 # =============================================================================
 # MAIN
 # =============================================================================
-st.title("\U0001f3ed DC Capacity Utilization Optimizer")
-st.markdown("Interactive scenario planning with penalty-based soft constraints.")
+_view = st.session_state.get("view", "map")
+_selected_dc = st.session_state.get("selected_dc")
+_on_detail = (_view == "accuracy") or (_view != "map" and _selected_dc)
 
-render_diagnostics()
-render_about()
+if _on_detail:
+    _title_col, _back_col = st.columns([5, 1])
+    with _title_col:
+        st.title("\U0001f3ed DC Capacity Tool")
+    with _back_col:
+        st.write("")  # vertical nudge so the button visually aligns with the title
+        if st.button("← Back to map", use_container_width=True, key="top_back"):
+            st.session_state["view"] = "map"
+            st.session_state["selected_dc"] = None
+            st.rerun()
+else:
+    st.title("\U0001f3ed DC Capacity Tool")
+
+st.markdown("Interactive scenario planning with penalty-based soft constraints.")
 
 # Always load the network summary — it's tiny (one row per DC) and powers both
 # the map and the "Back to map" trip. The NDC summary is optional: empty if the
