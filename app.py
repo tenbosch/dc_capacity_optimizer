@@ -2913,6 +2913,11 @@ else:
         render_ask_ai()
 
 st.markdown("Interactive scenario planning with penalty-based soft constraints.")
+if not _on_detail:
+    st.caption(
+        "All data shown is 100% synthetic and does not represent any actual "
+        "distribution center network."
+    )
 
 # Always load the network summary — it's tiny (one row per DC) and powers both
 # the map and the "Back to map" trip. The NDC summary is optional: empty if the
