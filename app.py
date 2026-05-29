@@ -23,9 +23,11 @@ FALLBACKS = OPT["fallback_capacities"]
 APP_CFG = CONFIG["app"]
 PSLIDERS = APP_CFG["penalty_sliders"]
 CMULTS = APP_CFG["capacity_multipliers"]
+REROUTE = APP_CFG["rerouting"]
 FACILITY_FILTER = CONFIG["synthetic_data"]["distribution_centers"]["facility_type"]
 SOLVER_PREFERENCE = OPT.get("solver_preference", ["cbc"])
 GENIE_SPACE_ID = os.getenv("DATABRICKS_GENIE_SPACE_ID")
+ASK_AI_SAMPLES = APP_CFG.get("ask_ai_sample_questions", [])
 
 # =============================================================================
 # PAGE CONFIG
@@ -189,6 +191,58 @@ def load_network_summary():
             df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0).astype(float)
     df["worst_util_pct"] = df[["ambient_util_pct", "cold_util_pct"]].max(axis=1)
     return df
+
+
+@st.cache_data(ttl=APP_CFG["cache_ttl_seconds"], show_spinner=False)
+def load_dc_distances(dc_id):
+    """Great-circle distance in miles from `dc_id` to every other Wholesale DC.
+
+    Uses Databricks geospatial ST functions: `ST_Point(longitude, latitude)`
+    builds a point GEOMETRY and `ST_DistanceSphere` returns the WGS84 spherical
+    distance in meters (÷ 1609.344 → miles). Distances are independent of the
+    max-radius slider, so we fetch them all once (cached per dc_id) and filter
+    by radius in Python. Falls back to a Python haversine on `df_summary`
+    coordinates if the runtime lacks ST functions — see `_haversine_distances`.
+    """
+    query = f"""
+    WITH src AS (
+      SELECT ST_Point(longitude, latitude) AS geom
+      FROM {SCHEMA}.distribution_centers
+      WHERE dc_id = %(dc_id)s
+    )
+    SELECT
+      d.dc_id,
+      ROUND(ST_DistanceSphere(ST_Point(d.longitude, d.latitude), src.geom)
+            / 1609.344, 1) AS distance_miles
+    FROM {SCHEMA}.distribution_centers d, src
+    WHERE d.dc_id <> %(dc_id)s
+      AND d.facility_type = %(facility_filter)s
+    ORDER BY distance_miles
+    """
+    df = run_query(query, {"dc_id": dc_id, "facility_filter": FACILITY_FILTER})
+    df["distance_miles"] = pd.to_numeric(df["distance_miles"], errors="coerce")
+    return df
+
+
+def _haversine_distances(dc_id, df_summary):
+    """Python fallback for `load_dc_distances` when ST functions are unavailable.
+
+    Computes great-circle miles from `dc_id` to every other WDC using the
+    lat/long already in `df_summary` (no SQL round-trip)."""
+    src = df_summary[df_summary["dc_id"] == dc_id]
+    if src.empty:
+        return pd.DataFrame(columns=["dc_id", "distance_miles"])
+    lat0, lon0 = float(src["latitude"].iloc[0]), float(src["longitude"].iloc[0])
+    others = df_summary[df_summary["dc_id"] != dc_id].copy()
+    lat1 = np.radians(others["latitude"].astype(float))
+    lon1 = np.radians(others["longitude"].astype(float))
+    lat0r, lon0r = np.radians(lat0), np.radians(lon0)
+    dlat, dlon = lat1 - lat0r, lon1 - lon0r
+    a = np.sin(dlat / 2) ** 2 + np.cos(lat0r) * np.cos(lat1) * np.sin(dlon / 2) ** 2
+    miles = 3958.7613 * 2 * np.arcsin(np.sqrt(a))
+    return (pd.DataFrame({"dc_id": others["dc_id"].values,
+                          "distance_miles": np.round(miles, 1)})
+            .sort_values("distance_miles").reset_index(drop=True))
 
 
 @st.cache_data(ttl=APP_CFG["cache_ttl_seconds"], show_spinner=False)
@@ -465,6 +519,34 @@ def load_transport_actuals(dc_id):
     return df
 
 
+@st.cache_data(ttl=APP_CFG["cache_ttl_seconds"], show_spinner=False)
+def load_dc_outbound_timeline(dc_id):
+    """Full outbound timeline for one DC: historical actuals + forward plan.
+
+    Unlike load_dc_data's forward-only `outbound_plan` (which feeds capacity
+    sizing per the history-window contract), this deliberately keeps the
+    historical rows so the Outbound Throughput chart can show what actually
+    shipped alongside the plan, split at today. `effective_date` is the
+    actual ship date for shipped rows and the scheduled date for the forward
+    plan; `is_actual` flags the historical side.
+    """
+    q = f"""
+    SELECT
+      order_number,
+      carrier_id,
+      scheduled_ship_date,
+      actual_ship_date,
+      COALESCE(actual_ship_date, scheduled_ship_date) AS effective_date,
+      (actual_ship_date IS NOT NULL)                  AS is_actual,
+      outbound_pallets,
+      outbound_units,
+      actual_units
+    FROM {SCHEMA}.outbound_plan
+    WHERE dc_id = %(dc_id)s
+    """
+    return run_query(q, {"dc_id": dc_id})
+
+
 # =============================================================================
 # ABOUT
 # =============================================================================
@@ -547,20 +629,65 @@ def _ask_genie(prompt):
     return ("\n\n".join(text_parts) or "_(no text response)_"), sql_text, df
 
 
+def _fill_ask_input(question):
+    """Sample-question button callback: drop the text into the input box so the
+    user can edit it and then Send. Runs before the rerun, so the text_area
+    (keyed 'ask_ai_input') renders pre-filled. Also marks the samples as used so
+    the quick-start buttons disappear once one is clicked."""
+    st.session_state["ask_ai_input"] = question
+    st.session_state["ask_ai_sample_used"] = True
+
+
+def _submit_ask_input():
+    """Send-button callback: stash the box contents as the pending prompt and
+    clear the box. Clearing a widget-keyed value is only legal inside a callback
+    (i.e. before the widget is re-instantiated on the next run)."""
+    q = st.session_state.get("ask_ai_input", "").strip()
+    if q:
+        st.session_state["ask_ai_pending"] = q
+        st.session_state["ask_ai_input"] = ""
+
+
 @st.dialog("\U0001f4ac Ask AI", width="large")
 def _ask_ai_dialog():
     if st.button("Start new conversation", key="ask_ai_reset"):
+        # Clear state but DON'T st.rerun() — calling rerun inside a @st.dialog
+        # dismisses the dialog. This block runs before the widgets below, so the
+        # rest of the body simply re-renders with the fresh (empty) state and the
+        # dialog stays open.
         st.session_state["ask_ai_messages"] = []
         st.session_state["ask_ai_conv_id"] = None
-        st.rerun()
+        st.session_state["ask_ai_input"] = ""
+        st.session_state["ask_ai_sample_used"] = False
 
     messages = st.session_state.setdefault("ask_ai_messages", [])
+    st.session_state.setdefault("ask_ai_input", "")
 
-    # Container placeholder reserves the slot ABOVE chat_input so the input
-    # always renders at the bottom of the dialog, regardless of how many
-    # messages get appended during this run.
+    # Container placeholder reserves the slot ABOVE the input controls so the
+    # conversation renders at the top and the sample buttons + input box stay
+    # pinned at the bottom, regardless of how many messages append this run.
     msg_area = st.container()
-    prompt = st.chat_input("Ask about DCs, demand, inventory, …")
+
+    # Optional quick-start prompts — shown only at the start of a session and
+    # hidden the moment a sample is clicked (or any message exists), to keep the
+    # dialog uncluttered. Each button prefills the box via callback; the user
+    # still edits/confirms and clicks Send.
+    if ASK_AI_SAMPLES and not messages and not st.session_state.get("ask_ai_sample_used"):
+        st.caption("Try one of these to get started:")
+        for i, q in enumerate(ASK_AI_SAMPLES):
+            st.button(q, key=f"ask_ai_sample_{i}", use_container_width=True,
+                      on_click=_fill_ask_input, args=(q,))
+
+    st.text_area(
+        "Your question", key="ask_ai_input",
+        placeholder="Ask about DCs, demand, inventory, …",
+        label_visibility="collapsed", height=80,
+    )
+    st.button("Send ▶", key="ask_ai_send", type="primary",
+              on_click=_submit_ask_input)
+
+    # Send stashes the box text here; pop it so it's processed exactly once.
+    prompt = st.session_state.pop("ask_ai_pending", None)
 
     with msg_area:
         for m in messages:
@@ -1906,6 +2033,257 @@ def _render_dc_accuracy_section(dc_id, df_products, selected_category):
 
 
 # =============================================================================
+# CAPACITY REROUTING (heuristic — see "Capacity Overrides" sidebar toggle)
+# =============================================================================
+_REROUTE_TOL = 1.0  # cu ft below this is treated as zero overflow
+
+
+def compute_rerouting(dc_id, df_summary, df_ov, distances, max_miles):
+    """Greedy nearest-first allocation of a DC's peak storage overflow to the
+    closest DCs that still have storage headroom.
+
+    The per-DC LP is left untouched — this post-processes its `overflow` frame.
+    Ambient and cold are tracked separately because cold-chain inventory can
+    only consume cold headroom. Headroom is exact capacity minus current
+    inventory (cu ft), drawn from `df_summary` (the network summary).
+
+    Returns (plan_df, totals):
+      plan_df  — one row per in-range candidate DC, sorted by distance, with
+                 headroom, rerouted cu ft, and a status label.
+      totals   — dict of overflow / absorbed / residual (ambient + cold) plus
+                 candidate counts.
+    """
+    peak_amb = float(df_ov["ambient_overflow"].max()) if "ambient_overflow" in df_ov else 0.0
+    peak_cold = float(df_ov["cold_overflow"].max()) if "cold_overflow" in df_ov else 0.0
+    rem_amb, rem_cold = peak_amb, peak_cold
+
+    others = df_summary[df_summary["dc_id"] != dc_id]
+    cand = others.merge(distances, on="dc_id", how="inner")
+    n_total = len(cand)
+    cand = cand[cand["distance_miles"] <= max_miles].sort_values("distance_miles")
+    n_in_range = len(cand)
+
+    rows = []
+    for _, r in cand.iterrows():
+        amb_head = max(float(r["ambient_cube_ft3"]) - float(r["ambient_inventory_cube_ft3"]), 0.0)
+        cold_head = max(float(r["cold_cube_ft3"]) - float(r["cold_inventory_cube_ft3"]), 0.0)
+        before_rem = rem_amb + rem_cold
+        take_amb = min(rem_amb, amb_head)
+        take_cold = min(rem_cold, cold_head)
+        rem_amb -= take_amb
+        rem_cold -= take_cold
+        rerouted = take_amb + take_cold
+
+        if before_rem <= _REROUTE_TOL:
+            status = "— not needed"
+        elif (rem_amb + rem_cold) <= _REROUTE_TOL:
+            status = "✅ absorbs all remaining"
+        elif rerouted > _REROUTE_TOL:
+            status = "⚠ partial (headroom-limited)"
+        else:
+            status = "— no headroom"
+
+        rows.append({
+            "dc_id": r["dc_id"],
+            "facility_name": r["facility_name"],
+            "location": f'{r["city"]}, {r["state_code"]}',
+            "distance_miles": float(r["distance_miles"]),
+            "latitude": float(r["latitude"]),
+            "longitude": float(r["longitude"]),
+            "ambient_headroom": amb_head,
+            "cold_headroom": cold_head,
+            "rerouted_amb": take_amb,
+            "rerouted_cold": take_cold,
+            "rerouted": rerouted,
+            "status": status,
+        })
+
+    plan_df = pd.DataFrame(rows)
+    overflow_total = peak_amb + peak_cold
+    residual = rem_amb + rem_cold
+    absorbed = overflow_total - residual
+    totals = {
+        "overflow": overflow_total,
+        "absorbed": absorbed,
+        "residual": residual,
+        "absorbed_pct": (100.0 * absorbed / overflow_total) if overflow_total > _REROUTE_TOL else 0.0,
+        "peak_amb": peak_amb,
+        "peak_cold": peak_cold,
+        "residual_amb": rem_amb,
+        "residual_cold": rem_cold,
+        "n_receiving": int((plan_df["rerouted"] > _REROUTE_TOL).sum()) if not plan_df.empty else 0,
+        "n_in_range": n_in_range,
+        "n_out_of_range": n_total - n_in_range,
+    }
+    return plan_df, totals
+
+
+def _render_rerouting_section(dc_id, df_summary, df_ov, max_miles):
+    """Combined panel: KPI strip → map with flow arcs → ranked table. Driven by
+    `compute_rerouting`. Distances come from `load_dc_distances` (ST functions),
+    falling back to a Python haversine if the runtime lacks geospatial SQL."""
+    try:
+        distances = load_dc_distances(dc_id)
+        if distances.empty:
+            raise ValueError("empty distance set")
+    except Exception:
+        distances = _haversine_distances(dc_id, df_summary)
+        st.caption(
+            "_Distances computed with a Python haversine fallback — the SQL "
+            "warehouse did not return geospatial `ST_*` results._"
+        )
+
+    plan_df, totals = compute_rerouting(dc_id, df_summary, df_ov, distances, max_miles)
+
+    if totals["overflow"] <= _REROUTE_TOL:
+        st.success(
+            "This DC stays within storage capacity in every period — "
+            "no overflow to reroute."
+        )
+        return
+
+    # --- KPI strip ---
+    k1, k2, k3, k4 = st.columns(4)
+    k1.metric("Peak storage overflow", f"{totals['overflow']:,.0f} cu ft")
+    k2.metric(
+        "Reroutable to nearby DCs", f"{totals['absorbed']:,.0f} cu ft",
+        delta=f"{totals['absorbed_pct']:.0f}% of overflow",
+        delta_color="normal",
+    )
+    k3.metric(
+        "Residual (no headroom)", f"{totals['residual']:,.0f} cu ft",
+        delta=f"-{totals['residual']:,.0f}" if totals["residual"] > _REROUTE_TOL else None,
+        delta_color="inverse",
+    )
+    k4.metric("Receiving DCs", f"{totals['n_receiving']}")
+    st.caption(
+        f"Greedy nearest-first allocation of this DC's peak-period storage "
+        f"overflow ({totals['peak_amb']:,.0f} cu ft ambient + "
+        f"{totals['peak_cold']:,.0f} cu ft cold) into DCs within {max_miles:,} mi. "
+        "Each candidate's headroom = its storage capacity − current inventory "
+        "(cu ft); cold overflow only fills cold headroom. Distance via Databricks "
+        "`ST_DistanceSphere` on DC lat/long."
+    )
+    if totals["n_out_of_range"] > 0:
+        st.caption(
+            f"{totals['n_out_of_range']} other DC(s) lie beyond the "
+            f"{max_miles:,}-mile radius and were excluded."
+        )
+
+    # --- Map with flow arcs ---
+    src_row = df_summary[df_summary["dc_id"] == dc_id]
+    if not src_row.empty and not plan_df.empty:
+        lat0 = float(src_row["latitude"].iloc[0])
+        lon0 = float(src_row["longitude"].iloc[0])
+        src_name = src_row["facility_name"].iloc[0]
+
+        fig = go.Figure()
+
+        # Arcs first so DC markers render on top. One line trace per receiving DC.
+        receiving = plan_df[plan_df["rerouted"] > _REROUTE_TOL]
+        for _, r in receiving.iterrows():
+            fig.add_trace(go.Scattergeo(
+                lon=[lon0, r["longitude"]], lat=[lat0, r["latitude"]],
+                mode="lines",
+                line=dict(width=2, color="#0B3D91"),
+                opacity=0.55,
+                hoverinfo="text",
+                text=(f"{dc_id} → {r['dc_id']}<br>{r['distance_miles']:,.0f} mi"
+                      f"<br>reroute {r['rerouted']:,.0f} cu ft"),
+                showlegend=False,
+            ))
+
+        # Candidate DCs — colored by total headroom (green = more room).
+        plan_df = plan_df.assign(total_headroom=plan_df["ambient_headroom"] + plan_df["cold_headroom"])
+        cand_custom = plan_df[[
+            "dc_id", "facility_name", "location", "distance_miles",
+            "ambient_headroom", "cold_headroom", "rerouted", "status",
+        ]].values
+        fig.add_trace(go.Scattergeo(
+            name="Candidate DC",
+            lon=plan_df["longitude"], lat=plan_df["latitude"],
+            customdata=cand_custom,
+            hovertemplate=(
+                "<b>%{customdata[1]}</b> (%{customdata[0]})<br>"
+                "%{customdata[2]} · %{customdata[3]:,.0f} mi<br>"
+                "Ambient headroom: %{customdata[4]:,.0f} cu ft<br>"
+                "Cold headroom: %{customdata[5]:,.0f} cu ft<br>"
+                "Rerouted here: %{customdata[6]:,.0f} cu ft<br>"
+                "%{customdata[7]}"
+                "<extra></extra>"
+            ),
+            marker=dict(
+                size=16,
+                color=plan_df["total_headroom"].astype(float),
+                colorscale="RdYlGn",
+                colorbar=dict(title="Head-<br>room<br>cu ft", thickness=12, len=0.6, x=1.02),
+                line=dict(width=1, color="white"),
+            ),
+            mode="markers",
+            showlegend=False,
+        ))
+
+        # Source DC — distinct red star, rendered last so it sits on top.
+        fig.add_trace(go.Scattergeo(
+            name="Over-capacity DC",
+            lon=[lon0], lat=[lat0],
+            text=[src_name],
+            hovertemplate=(
+                f"<b>{src_name}</b> ({dc_id})<br>"
+                f"Over capacity by {totals['overflow']:,.0f} cu ft"
+                "<extra></extra>"
+            ),
+            marker=dict(symbol="star", size=22, color="#D62728",
+                        line=dict(width=1.5, color="white")),
+            mode="markers",
+            showlegend=False,
+        ))
+
+        fig.update_layout(
+            geo=dict(
+                projection_type="equirectangular",
+                showland=True, landcolor="rgb(243, 243, 243)",
+                showsubunits=True, subunitcolor="rgb(217, 217, 217)",
+                showcountries=True, countrycolor="rgb(204, 204, 204)",
+                showlakes=True, lakecolor="rgb(255, 255, 255)",
+                lataxis=dict(range=[15, 52]),
+                lonaxis=dict(range=[-162, -64]),
+            ),
+            height=460,
+            margin=dict(l=0, r=0, t=10, b=0),
+        )
+        st.plotly_chart(fig, use_container_width=True, key="reroute_map")
+        st.caption(
+            "Red star = over-capacity DC; circles = candidate DCs colored by "
+            "available storage headroom (green = more room). Blue arcs show where "
+            "overflow would be sent."
+        )
+
+    # --- Ranked table ---
+    st.markdown("##### Nearest DCs and rerouting plan")
+    table = plan_df.assign(
+        **{
+            "Nearest DC": plan_df["dc_id"] + " — " + plan_df["facility_name"],
+            "Location": plan_df["location"],
+            "Distance (mi)": plan_df["distance_miles"].round(0),
+            "Ambient headroom (cu ft)": plan_df["ambient_headroom"].round(0),
+            "Cold headroom (cu ft)": plan_df["cold_headroom"].round(0),
+            "Rerouted (cu ft)": plan_df["rerouted"].round(0),
+            "Status": plan_df["status"],
+        }
+    )[[
+        "Nearest DC", "Location", "Distance (mi)",
+        "Ambient headroom (cu ft)", "Cold headroom (cu ft)",
+        "Rerouted (cu ft)", "Status",
+    ]]
+    st.dataframe(table, use_container_width=True, hide_index=True)
+    st.caption(
+        "Sorted by distance. Headroom = storage capacity − current inventory; "
+        "rerouted volume is filled nearest-first until the overflow is exhausted."
+    )
+
+
+# =============================================================================
 # DETAIL VIEW
 # =============================================================================
 def render_detail(dc_id, df_summary):
@@ -1923,6 +2301,7 @@ def render_detail(dc_id, df_summary):
             df_throughput = dc_tables["throughput_rates"]
             df_inbound = dc_tables["inbound_plan"]
             df_outbound = dc_tables["outbound_plan"]
+            df_outbound_timeline = load_dc_outbound_timeline(dc_id)
             df_params = dc_tables["optimization_parameters"]
             df_dc_meta = dc_tables["distribution_centers"]
 
@@ -2197,13 +2576,20 @@ def render_detail(dc_id, df_summary):
         inbound_by_sku = df_inbound.groupby("sku_id")["inbound_units"].sum().reset_index()
 
     df_coverage = (
-        df_inv_enriched[["sku_id", "product_category", "on_hand_units"]]
+        df_inv_enriched[["sku_id", "product_category", "on_hand_units",
+                         "storage_type", "total_cube_ft3"]]
         .merge(demand_by_sku, on="sku_id", how="left")
         .merge(inbound_by_sku, on="sku_id", how="left")
     )
     df_coverage["inbound_units"] = df_coverage["inbound_units"].fillna(0)
     df_coverage["total_demand"] = df_coverage["total_demand"].fillna(0)
     df_coverage["total_supply"] = df_coverage["on_hand_units"] + df_coverage["inbound_units"]
+    # On-hand cube split by storage class so each category's footprint can be
+    # measured against the DC's (shared) ambient / cold storage capacity.
+    df_coverage["cube_amb"] = np.where(
+        df_coverage["storage_type"] == "COLD", 0.0, df_coverage["total_cube_ft3"])
+    df_coverage["cube_cold"] = np.where(
+        df_coverage["storage_type"] == "COLD", df_coverage["total_cube_ft3"], 0.0)
     df_coverage["coverage_ratio"] = np.where(
         df_coverage["total_demand"] > 0,
         (df_coverage["total_supply"] / df_coverage["total_demand"]).round(2),
@@ -2228,7 +2614,7 @@ def render_detail(dc_id, df_summary):
         delta_color="inverse" if overall_coverage < 1.0 else "normal",
     )
     dc_col4.metric(
-        "SKUs At Risk", f"{at_risk_count} of {len(df_coverage)}",
+        "SKUs Under-Stocked", f"{at_risk_count} of {len(df_coverage)}",
         delta=f"{at_risk_count} under-stocked" if at_risk_count > 0 else "All covered",
         delta_color="inverse" if at_risk_count > 0 else "off",
     )
@@ -2238,7 +2624,7 @@ def render_detail(dc_id, df_summary):
         df_coverage,
         selected_category,
         sum_cols=("on_hand_units", "inbound_units", "total_supply", "total_demand",
-                  "surplus_deficit"),
+                  "surplus_deficit", "total_cube_ft3", "cube_amb", "cube_cold"),
         risk_col="at_risk",
     )
     df_cov_view["coverage_ratio"] = np.where(
@@ -2246,6 +2632,45 @@ def render_detail(dc_id, df_summary):
         (df_cov_view["total_supply"] / df_cov_view["total_demand"]).round(2),
         np.inf,
     )
+
+    # --- Per-group capacity footprint vs the DC's (shared) capacity pools. ---
+    # Storage: each group's on-hand cube as a share of its dominant storage
+    # class's capacity; the class is "over" when the DC-wide class utilization
+    # (amb_util_pct / cold_util_pct, computed in the inventory section) exceeds
+    # 100%. Throughput: the group's avg daily demand as a share of the DC's
+    # daily throughput capacity. Capacity is a shared pool, so a group is
+    # flagged when a constraint *it competes in* is breached, not when the
+    # group alone exceeds capacity.
+    max_throughput = float(df_capacity.iloc[0].get("max_daily_throughput_units", 0) or 0)
+    tp_demand_daily_all = (total_demand_all / max(n_planning_days, 1))
+    tp_util_pct_dc = (100.0 * tp_demand_daily_all / max_throughput) if max_throughput > 0 else 0.0
+    amb_over = amb_util_pct > 100.0
+    cold_over = cold_util_pct > 100.0
+    tp_over = tp_util_pct_dc > 100.0
+
+    def _cap_cols(row):
+        cold_dom = row["cube_cold"] >= row["cube_amb"]
+        cls_cube = row["cube_cold"] if cold_dom else row["cube_amb"]
+        cls_cap = cold_capacity if cold_dom else ambient_capacity
+        cls_lbl = "cold" if cold_dom else "amb"
+        stor_pct = (100.0 * cls_cube / cls_cap) if cls_cap > 0 else 0.0
+        daily_units = row["total_demand"] / max(n_planning_days, 1)
+        tp_pct = (100.0 * daily_units / max_throughput) if max_throughput > 0 else 0.0
+        issues = []
+        if row["cube_cold"] > 0 and cold_over:
+            issues.append("cold storage")
+        if row["cube_amb"] > 0 and amb_over:
+            issues.append("ambient storage")
+        if tp_over:
+            issues.append("throughput")
+        flag = ("⚠️ " + ", ".join(issues) + " over") if issues else "✅ Fits"
+        return pd.Series({
+            "storage_pct_str": f"{stor_pct:.0f}% {cls_lbl}",
+            "throughput_pct_str": f"{tp_pct:.0f}%",
+            "capacity_risk": flag,
+        })
+
+    df_cov_view = pd.concat([df_cov_view, df_cov_view.apply(_cap_cols, axis=1)], axis=1)
 
     dem_left, dem_right = st.columns(2)
     with dem_left:
@@ -2305,37 +2730,52 @@ def render_detail(dc_id, df_summary):
         f"\U0001f50d Coverage detail by SKU — {selected_category}"
     )
     with st.expander(expander_label, expanded=False):
+        df_cov_view["storage_cube"] = df_cov_view["total_cube_ft3"].round(0)
         if selected_category is None:
             cov_display = df_cov_view[[
                 "group_label", "on_hand_units", "inbound_units", "total_supply",
                 "total_demand", "surplus_deficit", "coverage_ratio",
-                "n_at_risk", "n_total",
+                "storage_cube", "storage_pct_str", "throughput_pct_str",
+                "capacity_risk", "n_at_risk", "n_total",
             ]].copy()
-            cov_display["At Risk"] = cov_display.apply(
+            cov_display["Supply Risk"] = cov_display.apply(
                 lambda r: f"⚠️ {int(r['n_at_risk'])} of {int(r['n_total'])}"
                           if int(r["n_at_risk"]) > 0 else "✅ All covered",
                 axis=1,
             )
             cov_display = cov_display.drop(columns=["n_at_risk", "n_total"])
+            cov_display = cov_display[[
+                "group_label", "on_hand_units", "inbound_units", "total_supply",
+                "total_demand", "surplus_deficit", "coverage_ratio", "Supply Risk",
+                "storage_cube", "storage_pct_str", "throughput_pct_str", "capacity_risk",
+            ]]
             cov_display.columns = [
                 "Category", "On-Hand", "Inbound", "Total Supply",
-                "Total Demand", "Surplus / Deficit", "Coverage Ratio", "At Risk",
+                "Total Demand", "Surplus / Deficit", "Coverage Ratio", "Supply Risk",
+                "Storage (cu ft)", "Storage % Cap", "Throughput % Cap", "Capacity Risk",
             ]
         else:
             cov_display = df_cov_view[[
                 "group_label", "on_hand_units", "inbound_units", "total_supply",
                 "total_demand", "surplus_deficit", "coverage_ratio", "at_risk",
+                "storage_cube", "storage_pct_str", "throughput_pct_str", "capacity_risk",
             ]].copy()
             cov_display["at_risk"] = cov_display["at_risk"].map({True: "⚠️ YES", False: "✅ No"})
             cov_display.columns = [
                 "SKU", "On-Hand", "Inbound", "Total Supply",
-                "Total Demand", "Surplus / Deficit", "Coverage Ratio", "At Risk",
+                "Total Demand", "Surplus / Deficit", "Coverage Ratio", "Supply Risk",
+                "Storage (cu ft)", "Storage % Cap", "Throughput % Cap", "Capacity Risk",
             ]
         cov_display = cov_display.sort_values("Coverage Ratio")
         st.caption(
-            "Per-group supply (on-hand + inbound) vs. demand. "
-            "Coverage ratio = total_supply / total_demand; "
-            "items below 1.0 are flagged at-risk."
+            "Two independent risks per group. **Supply Risk** = can demand be met "
+            "from stock? (on-hand + inbound vs. demand; coverage ratio < 1.0 = "
+            "under-stocked SKUs). **Capacity Risk** = does the DC have room to hold "
+            "and move it? Storage % Cap = group on-hand cube ÷ its dominant storage "
+            "class (ambient/cold) capacity; Throughput % Cap = group avg daily demand "
+            "÷ daily throughput capacity. Capacity is a shared pool, so each % is the "
+            "group's share of it, and a group is flagged ⚠️ when a constraint it "
+            "competes in (cold/ambient storage or throughput) is over 100% DC-wide."
         )
         st.dataframe(cov_display, use_container_width=True, hide_index=True)
 
@@ -2343,35 +2783,43 @@ def render_detail(dc_id, df_summary):
     _render_dc_accuracy_section(dc_id, df_products, selected_category)
 
     # --- Outbound Throughput (WDC → Local Couriers) ---
-    if df_outbound is not None and not df_outbound.empty:
+    if df_outbound_timeline is not None and not df_outbound_timeline.empty:
         st.markdown("---")
         st.subheader("\U0001f69a Outbound Throughput to Local Couriers")
         st.caption(
             "Product leaving this DC for last-mile delivery. Each pallet is "
-            "tendered to a local courier (FedEx, UPS, XPO, or SAIA)."
+            "tendered to a local courier (FedEx, UPS, XPO, or SAIA). Shipped "
+            "actuals (history) and the forward plan are split at today."
         )
 
-        df_ob = df_outbound.copy()
-        df_ob["scheduled_ship_date"] = pd.to_datetime(df_ob["scheduled_ship_date"])
+        df_ob = df_outbound_timeline.copy()
+        df_ob["effective_date"] = pd.to_datetime(df_ob["effective_date"])
+        df_ob["is_actual"] = df_ob["is_actual"].astype(bool)
         df_ob["outbound_pallets"] = pd.to_numeric(df_ob["outbound_pallets"], errors="coerce").fillna(0)
         df_ob["outbound_units"] = pd.to_numeric(df_ob["outbound_units"], errors="coerce").fillna(0).astype(int)
+        df_ob["actual_units"] = pd.to_numeric(df_ob["actual_units"], errors="coerce").fillna(0).astype(int)
 
+        today = pd.Timestamp.today().normalize()
+
+        # Daily series carries is_actual so history vs. plan stay distinct;
+        # each date falls entirely on one side of today.
         daily_ob = (
-            df_ob.groupby("scheduled_ship_date")
+            df_ob.groupby(["effective_date", "is_actual"])
                 .agg(pallets=("outbound_pallets", "sum"),
                      units=("outbound_units", "sum"),
                      orders=("order_number", "nunique"))
                 .reset_index()
-                .sort_values("scheduled_ship_date")
+                .sort_values("effective_date")
         )
+        daily_pallets = daily_ob.groupby("effective_date")["pallets"].sum()
 
         max_ob_pallets = float(df_capacity.iloc[0].get("max_daily_outbound_pallets", 0) or 0)
-        avg_daily = daily_ob["pallets"].mean() if len(daily_ob) else 0.0
-        peak_daily = daily_ob["pallets"].max() if len(daily_ob) else 0.0
+        avg_daily = daily_pallets.mean() if len(daily_pallets) else 0.0
+        peak_daily = daily_pallets.max() if len(daily_pallets) else 0.0
         peak_util = (100.0 * peak_daily / max_ob_pallets) if max_ob_pallets > 0 else 0.0
         avg_util = (100.0 * avg_daily / max_ob_pallets) if max_ob_pallets > 0 else 0.0
-        total_units = int(df_ob["outbound_units"].sum())
-        total_orders = int(df_ob["order_number"].nunique())
+        units_shipped = int(df_ob.loc[df_ob["is_actual"], "actual_units"].sum())
+        units_planned = int(df_ob.loc[~df_ob["is_actual"], "outbound_units"].sum())
 
         ob_col1, ob_col2, ob_col3, ob_col4, ob_col5 = st.columns(5)
         ob_col1.metric("Avg Daily Outbound", f"{avg_daily:,.0f} pallets")
@@ -2384,29 +2832,43 @@ def render_detail(dc_id, df_summary):
             "Avg Dock Utilization", f"{avg_util:.1f}%" if max_ob_pallets > 0 else "n/a",
             help=f"Outbound dock capacity: {max_ob_pallets:,.0f} pallets/day",
         )
-        ob_col4.metric("Total Units Shipped", f"{total_units:,}")
-        ob_col5.metric("Total Orders", f"{total_orders:,}")
+        ob_col4.metric("Units Shipped (history)", f"{units_shipped:,}")
+        ob_col5.metric("Units Planned (forward)", f"{units_planned:,}")
 
         ob_left, ob_right = st.columns([2, 1])
         with ob_left:
+            hist = daily_ob[daily_ob["is_actual"]]
+            fwd = daily_ob[~daily_ob["is_actual"]]
             fig_ob = go.Figure()
             fig_ob.add_trace(go.Bar(
-                x=daily_ob["scheduled_ship_date"], y=daily_ob["pallets"],
-                name="Pallets shipped", marker_color="#636EFA",
+                x=hist["effective_date"], y=hist["pallets"],
+                name="Shipped (actual)", marker_color="#00CC96",
+            ))
+            fig_ob.add_trace(go.Bar(
+                x=fwd["effective_date"], y=fwd["pallets"],
+                name="Planned", marker_color="#636EFA",
             ))
             if max_ob_pallets > 0:
                 fig_ob.add_hline(
                     y=max_ob_pallets, line_dash="dash", line_color="red",
                     annotation_text=f"Dock capacity ({int(max_ob_pallets):,}/day)",
                 )
+            # Pass x as epoch-ms (numeric): add_vline with an annotation averages
+            # its x-values internally and raises on sum([Timestamp]).
+            fig_ob.add_vline(
+                x=today.timestamp() * 1000, line_dash="dot", line_color="gray",
+                annotation_text="Today", annotation_position="top",
+            )
             fig_ob.update_layout(
                 title="Daily Outbound Volume to Local Couriers",
                 xaxis_title="Ship date", yaxis_title="Pallets",
-                height=400,
+                height=400, barmode="overlay",
+                legend=dict(orientation="h", y=1.08, x=0),
             )
             st.plotly_chart(fig_ob, use_container_width=True)
             st.caption(
-                "Pallets shipped per day from this DC. "
+                "Pallets shipped per day from this DC — green is historical actuals "
+                "(by actual ship date), blue is the forward plan (by scheduled ship date). "
                 "Dashed line = configured outbound dock capacity from `dc_capacity`."
             )
 
@@ -2427,16 +2889,19 @@ def render_detail(dc_id, df_summary):
                                           legend=dict(orientation="h", y=-0.1))
                 st.plotly_chart(fig_carrier, use_container_width=True)
                 st.caption(
-                    "Share of outbound pallets by courier over the planning horizon."
+                    "Share of outbound pallets by courier across history and the forward plan."
                 )
 
         with st.expander("\U0001f4cb Daily outbound detail", expanded=False):
             st.caption(
-                "Per-day shipped pallets, units, and order count, plus dock utilization "
-                "(Capacity % = pallets / max_daily_outbound_pallets)."
+                "Per-day pallets, units, and order count, plus dock utilization "
+                "(Capacity % = pallets / max_daily_outbound_pallets). "
+                "Type marks historical actuals vs. forward plan."
             )
             disp = daily_ob.copy()
-            disp.columns = ["Ship Date", "Pallets", "Units", "Orders"]
+            disp["is_actual"] = disp["is_actual"].map({True: "Actual", False: "Planned"})
+            disp = disp[["effective_date", "is_actual", "pallets", "units", "orders"]]
+            disp.columns = ["Ship Date", "Type", "Pallets", "Units", "Orders"]
             disp["Pallets"] = disp["Pallets"].round(1)
             if max_ob_pallets > 0:
                 disp["Capacity %"] = (100.0 * disp["Pallets"] / max_ob_pallets).round(1)
@@ -2504,6 +2969,21 @@ def render_detail(dc_id, df_summary):
         value=float(CMULTS["throughput"]["default"]),
         step=float(CMULTS["throughput"]["step"]),
         help="Simulate expanded or reduced processing capacity",
+    )
+    enable_rerouting = st.sidebar.checkbox(
+        "Recommend rerouting to nearby DCs",
+        value=bool(REROUTE["enabled_default"]),
+        help="When a DC exceeds storage capacity, find the closest DCs with "
+             "headroom and recommend where to send the overflow.",
+    )
+    max_reroute_miles = st.sidebar.slider(
+        "Max rerouting distance (miles)",
+        min_value=int(REROUTE["max_distance_miles"]["min"]),
+        max_value=int(REROUTE["max_distance_miles"]["max"]),
+        value=int(REROUTE["max_distance_miles"]["default"]),
+        step=int(REROUTE["max_distance_miles"]["step"]),
+        help="Only DCs within this radius are considered as reroute targets.",
+        disabled=not enable_rerouting,
     )
 
     st.sidebar.subheader("Scenario Comparison")
@@ -2602,12 +3082,23 @@ def render_detail(dc_id, df_summary):
             "\U0001f4e6 Fill Rate by Category" if selected_category is None
             else f"\U0001f4e6 Fill Rate — {selected_category}"
         )
-        tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
+        # The Rerouting tab is opt-in (Capacity Overrides sidebar toggle): when
+        # off, the results view is the standard six-tab layout; when on, a
+        # "Rerouting" tab is inserted right after Overflow Analysis.
+        tab_labels = [
             "\U0001f4ca Capacity Utilization", "\U0001f69a Outbound Volume",
             "⚠️ Overflow Analysis",
             fill_tab_label, "\U0001f477 Labor Allocation",
             "\U0001f4e6 Inventory Trajectory",
-        ])
+        ]
+        if enable_rerouting:
+            tab_labels.insert(3, "\U0001f500 Rerouting")
+        _tabs = st.tabs(tab_labels)
+        if enable_rerouting:
+            tab1, tab2, tab3, tab_reroute, tab4, tab5, tab6 = _tabs
+        else:
+            tab1, tab2, tab3, tab4, tab5, tab6 = _tabs
+            tab_reroute = None
 
         # Join product_category onto the LP fulfillment frame so the SKU-level
         # tabs (fill rate, heatmap) can roll up or drill down on the same axis
@@ -2615,6 +3106,11 @@ def render_detail(dc_id, df_summary):
         df_ful = df_ful.merge(
             df_products[["sku_id", "product_category"]], on="sku_id", how="left",
         )
+
+        if tab_reroute is not None:
+            with tab_reroute:
+                st.markdown("#### Reroute overflow to nearby DCs")
+                _render_rerouting_section(dc_id, df_summary, df_ov, max_reroute_miles)
 
         with tab1:
             fig = go.Figure()
