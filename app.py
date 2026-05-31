@@ -596,7 +596,7 @@ def _render_ask_ai_message(role, content, sql_text=None, df=None):
             with st.expander("Generated SQL"):
                 st.code(sql_text, language="sql")
         if df is not None and not df.empty:
-            st.dataframe(df, use_container_width=True, hide_index=True)
+            st.dataframe(df, width="stretch", hide_index=True)
 
 
 def _ask_genie(prompt):
@@ -675,7 +675,7 @@ def _ask_ai_dialog():
     if ASK_AI_SAMPLES and not messages and not st.session_state.get("ask_ai_sample_used"):
         st.caption("Try one of these to get started:")
         for i, q in enumerate(ASK_AI_SAMPLES):
-            st.button(q, key=f"ask_ai_sample_{i}", use_container_width=True,
+            st.button(q, key=f"ask_ai_sample_{i}", width="stretch",
                       on_click=_fill_ask_input, args=(q,))
 
     st.text_area(
@@ -711,7 +711,7 @@ def _ask_ai_dialog():
                     with st.expander("Generated SQL"):
                         st.code(sql_text, language="sql")
                 if df is not None and not df.empty:
-                    st.dataframe(df, use_container_width=True, hide_index=True)
+                    st.dataframe(df, width="stretch", hide_index=True)
             messages.append({
                 "role": "assistant", "content": text,
                 "sql": sql_text, "df": df,
@@ -721,7 +721,7 @@ def _ask_ai_dialog():
 def render_ask_ai():
     if not GENIE_SPACE_ID:
         return
-    if st.button("\U0001f4ac Ask AI", use_container_width=True, key="ask_ai_open"):
+    if st.button("\U0001f4ac Ask AI", width="stretch", key="ask_ai_open"):
         _ask_ai_dialog()
 
 
@@ -852,7 +852,7 @@ def render_map(df_summary, df_ndc_summary=None):
     try:
         event = st.plotly_chart(
             fig,
-            use_container_width=True,
+            width="stretch",
             key="dc_map",
             on_select="rerun",
             selection_mode="points",
@@ -875,7 +875,7 @@ def render_map(df_summary, df_ndc_summary=None):
     except TypeError:
         # Streamlit too old for on_select — render the chart non-interactively;
         # the dropdown+button below handles drill-in.
-        st.plotly_chart(fig, use_container_width=True)
+        st.plotly_chart(fig, width="stretch")
 
     # Below-the-map quick-pick fallback. Streamlit click events occasionally do
     # not propagate on first interaction; this gives the user a deterministic
@@ -884,7 +884,7 @@ def render_map(df_summary, df_ndc_summary=None):
     acc_col, _ = st.columns([1, 2])
     with acc_col:
         if st.button("\U0001f4ca View network forecast accuracy",
-                     use_container_width=True, key="open_accuracy"):
+                     width="stretch", key="open_accuracy"):
             st.session_state["view"] = "accuracy"
             st.session_state["selected_dc"] = None
             st.rerun()
@@ -906,7 +906,7 @@ def render_map(df_summary, df_ndc_summary=None):
             format_func=lambda i: labels[i],
             key="map_quick_pick",
         )
-        if st.button("Open DC detail", use_container_width=True):
+        if st.button("Open DC detail", width="stretch"):
             st.session_state["selected_dc"] = ids[choice]
             st.session_state["view"] = "detail"
             st.rerun()
@@ -1065,7 +1065,7 @@ def render_accuracy_network(df_summary):
         xaxis=dict(title=""),
         legend=dict(orientation="h", y=1.1),
     )
-    st.plotly_chart(fig_trend, use_container_width=True)
+    st.plotly_chart(fig_trend, width="stretch")
 
     st.markdown("---")
     st.markdown("#### DC ranking — MAPE (worst at top)")
@@ -1098,7 +1098,7 @@ def render_accuracy_network(df_summary):
         margin=dict(l=10, r=10, t=10, b=10),
         yaxis=dict(autorange="reversed"),
     )
-    st.plotly_chart(fig_rank, use_container_width=True)
+    st.plotly_chart(fig_rank, width="stretch")
 
     st.markdown("---")
     st.markdown("#### Drill into a DC")
@@ -1113,7 +1113,7 @@ def render_accuracy_network(df_summary):
             format_func=lambda i: labels[i],
             key="acc_quick_pick",
         )
-        if st.button("Open DC accuracy detail", use_container_width=True):
+        if st.button("Open DC accuracy detail", width="stretch"):
             st.session_state["selected_dc"] = ids[choice]
             st.session_state["view"] = "detail"
             st.session_state["jump_to_accuracy"] = True
@@ -1263,7 +1263,7 @@ def render_ndc_detail(dc_id):
         barmode="group", height=400,
         legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
     )
-    st.plotly_chart(fig_flow, use_container_width=True)
+    st.plotly_chart(fig_flow, width="stretch")
 
     # Sankey: pharma -> NDC -> WDC
     if not df_out.empty:
@@ -1325,7 +1325,7 @@ def render_ndc_detail(dc_id):
                 plot_bgcolor="white",
                 margin=dict(l=10, r=10, t=10, b=10),
             )
-            st.plotly_chart(fig_sankey, use_container_width=True)
+            st.plotly_chart(fig_sankey, width="stretch")
         else:
             st.caption("Not enough data for Sankey on this day.")
 
@@ -1349,7 +1349,7 @@ def render_ndc_detail(dc_id):
             xaxis_title="Dwell time (hours)", yaxis_title="Pallet count",
             height=350,
         )
-        st.plotly_chart(fig_hist, use_container_width=True)
+        st.plotly_chart(fig_hist, width="stretch")
 
     with st.expander("\U0001f4cb Daily breakdown table", expanded=False):
         st.caption(
@@ -1373,7 +1373,7 @@ def render_ndc_detail(dc_id):
         else:
             per_day = per_day_in
         per_day.columns = [c.replace("_", " ").title() for c in per_day.columns]
-        st.dataframe(per_day, use_container_width=True, hide_index=True)
+        st.dataframe(per_day, width="stretch", hide_index=True)
 
 
 # =============================================================================
@@ -1636,7 +1636,8 @@ def category_or_sku(df, selected_category, sum_cols=(), wavg_cols=(), risk_col=N
             w = (
                 df.groupby("product_category")
                   .apply(lambda g: (g[value_col] * g[weight_col]).sum()
-                                   / max(g[weight_col].sum(), 1))
+                                   / max(g[weight_col].sum(), 1),
+                         include_groups=False)
                   .rename(value_col)
                   .reset_index()
             )
@@ -1845,7 +1846,7 @@ def _render_dc_accuracy_section(dc_id, df_products, selected_category):
             yaxis=dict(title="Units"),
             legend=dict(orientation="h", y=1.1),
         )
-        st.plotly_chart(fig_fa, use_container_width=True)
+        st.plotly_chart(fig_fa, width="stretch")
 
         # Bias % diverging bar
         st.markdown("##### Bias % (positive = over-forecast)")
@@ -1868,7 +1869,7 @@ def _render_dc_accuracy_section(dc_id, df_products, selected_category):
             xaxis=dict(tickformat=".0%"),
             coloraxis_showscale=False,
         )
-        st.plotly_chart(fig_bias, use_container_width=True)
+        st.plotly_chart(fig_bias, width="stretch")
 
         # SKU × week MAPE heatmap (only in drill mode where there are few SKUs)
         if selected_category is not None:
@@ -1895,7 +1896,7 @@ def _render_dc_accuracy_section(dc_id, df_products, selected_category):
             )
             fig_heat.update_layout(height=max(220, 18 * len(heat_p)),
                                    margin=dict(l=10, r=10, t=10, b=10))
-            st.plotly_chart(fig_heat, use_container_width=True)
+            st.plotly_chart(fig_heat, width="stretch")
 
         # =====================================================================
         # Variance drivers (Feature 2) — tabs (not expanders) because Streamlit
@@ -1931,7 +1932,7 @@ def _render_dc_accuracy_section(dc_id, df_products, selected_category):
             )
             fig_wow.add_hline(y=0, line_dash="dash", line_color="gray")
             fig_wow.update_layout(height=280, margin=dict(l=10, r=10, t=10, b=10))
-            st.plotly_chart(fig_wow, use_container_width=True)
+            st.plotly_chart(fig_wow, width="stretch")
 
             top_off = (
                 per_sku.merge(df_products[["sku_id", "product_category"]], on="sku_id", how="left")
@@ -1949,7 +1950,7 @@ def _render_dc_accuracy_section(dc_id, df_products, selected_category):
             )
             st.dataframe(
                 top_off[["sku_id", "product_category", "actual_units", "abs_error_units", "mape"]],
-                use_container_width=True, hide_index=True,
+                width="stretch", hide_index=True,
             )
 
         # --- D2: Inventory drivers ---
@@ -1978,7 +1979,7 @@ def _render_dc_accuracy_section(dc_id, df_products, selected_category):
                     "SKUs at greatest inventory risk. "
                     "DoS = on_hand_units / average daily forecasted demand."
                 )
-                st.dataframe(df_inv, use_container_width=True, hide_index=True)
+                st.dataframe(df_inv, width="stretch", hide_index=True)
 
         # --- D3: Transportation drivers ---
         with tab_tx:
@@ -2029,7 +2030,7 @@ def _render_dc_accuracy_section(dc_id, df_products, selected_category):
                     height=max(260, 22 * len(by_partner)),
                     margin=dict(l=10, r=10, t=10, b=10),
                 )
-                st.plotly_chart(fig_partner, use_container_width=True)
+                st.plotly_chart(fig_partner, width="stretch")
 
 
 # =============================================================================
@@ -2170,9 +2171,20 @@ def _render_rerouting_section(dc_id, df_summary, df_ov, max_miles):
             f"{max_miles:,}-mile radius and were excluded."
         )
 
+    # No candidate DCs within range (e.g. an isolated DC like San Juan at the
+    # default radius) → plan_df is empty (no columns). Stop before the map/table,
+    # which index plan_df by column and would otherwise KeyError.
+    if plan_df.empty:
+        st.warning(
+            f"No other DCs lie within {max_miles:,} miles, so none of the "
+            f"{totals['overflow']:,.0f} cu ft overflow can be rerouted. "
+            "Increase the max rerouting distance to widen the search."
+        )
+        return
+
     # --- Map with flow arcs ---
     src_row = df_summary[df_summary["dc_id"] == dc_id]
-    if not src_row.empty and not plan_df.empty:
+    if not src_row.empty:
         lat0 = float(src_row["latitude"].iloc[0])
         lon0 = float(src_row["longitude"].iloc[0])
         src_name = src_row["facility_name"].iloc[0]
@@ -2252,7 +2264,7 @@ def _render_rerouting_section(dc_id, df_summary, df_ov, max_miles):
             height=460,
             margin=dict(l=0, r=0, t=10, b=0),
         )
-        st.plotly_chart(fig, use_container_width=True, key="reroute_map")
+        st.plotly_chart(fig, width="stretch", key="reroute_map")
         st.caption(
             "Red star = over-capacity DC; circles = candidate DCs colored by "
             "available storage headroom (green = more room). Blue arcs show where "
@@ -2276,7 +2288,7 @@ def _render_rerouting_section(dc_id, df_summary, df_ov, max_miles):
         "Ambient headroom (cu ft)", "Cold headroom (cu ft)",
         "Rerouted (cu ft)", "Status",
     ]]
-    st.dataframe(table, use_container_width=True, hide_index=True)
+    st.dataframe(table, width="stretch", hide_index=True)
     st.caption(
         "Sorted by distance. Headroom = storage capacity − current inventory; "
         "rerouted volume is filled nearest-first until the overflow is exhausted."
@@ -2443,7 +2455,7 @@ def render_detail(dc_id, df_summary):
         yaxis_title="cu ft",
         showlegend=True,
     )
-    st.plotly_chart(fig_storage, use_container_width=True)
+    st.plotly_chart(fig_storage, width="stretch")
 
     # Roll up to product_category or filter to one category's SKUs.
     df_inv_view = category_or_sku(
@@ -2475,7 +2487,7 @@ def render_detail(dc_id, df_summary):
                     "days_of_supply": "Days of Supply"},
         )
         fig_inv_units.update_layout(height=350)
-        st.plotly_chart(fig_inv_units, use_container_width=True)
+        st.plotly_chart(fig_inv_units, width="stretch")
         st.caption(
             "Units on-hand by category (or SKU when drilled in), "
             "color-graded by days-of-supply (red = low coverage). "
@@ -2498,7 +2510,7 @@ def render_detail(dc_id, df_summary):
                 annotation_text=f"Avg capacity per {group_axis_label.lower()}",
             )
         fig_cube.update_layout(height=350)
-        st.plotly_chart(fig_cube, use_container_width=True)
+        st.plotly_chart(fig_cube, width="stretch")
         st.caption(
             "Physical cube ft consumed per group, computed as "
             "Σ(on_hand_units × unit_cube_ft3). Red line = average capacity share per group."
@@ -2558,7 +2570,7 @@ def render_detail(dc_id, df_summary):
             ]
             inv_display = inv_display.sort_values(["Storage Type", "SKU"])
             styler = inv_display.style.format(_INV_NUM_FORMATS)
-            st.dataframe(styler, use_container_width=True, hide_index=True)
+            st.dataframe(styler, width="stretch", hide_index=True)
 
     # --- Demand vs Coverage ---
     st.markdown("---")
@@ -2691,7 +2703,7 @@ def render_detail(dc_id, df_summary):
             yaxis_title="Units", barmode="group", height=400,
             legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
         )
-        st.plotly_chart(fig_cov, use_container_width=True)
+        st.plotly_chart(fig_cov, width="stretch")
         st.caption(
             "Per-group on-hand (blue) and scheduled inbound (green) compared "
             "against total forecasted demand (red) over the planning horizon. "
@@ -2718,7 +2730,7 @@ def render_detail(dc_id, df_summary):
             title="Daily Demand Over Planning Horizon",
             xaxis_title="Date", yaxis_title="Units", height=400,
         )
-        st.plotly_chart(fig_daily, use_container_width=True)
+        st.plotly_chart(fig_daily, width="stretch")
         st.caption(
             "Total forecasted units shipping out of this DC per day, "
             "summed across all SKUs. Dashed line = average daily supply for reference."
@@ -2777,7 +2789,7 @@ def render_detail(dc_id, df_summary):
             "group's share of it, and a group is flagged ⚠️ when a constraint it "
             "competes in (cold/ambient storage or throughput) is over 100% DC-wide."
         )
-        st.dataframe(cov_display, use_container_width=True, hide_index=True)
+        st.dataframe(cov_display, width="stretch", hide_index=True)
 
     # --- Forecast Accuracy + Variance Drivers ---
     _render_dc_accuracy_section(dc_id, df_products, selected_category)
@@ -2865,7 +2877,7 @@ def render_detail(dc_id, df_summary):
                 height=400, barmode="overlay",
                 legend=dict(orientation="h", y=1.08, x=0),
             )
-            st.plotly_chart(fig_ob, use_container_width=True)
+            st.plotly_chart(fig_ob, width="stretch")
             st.caption(
                 "Pallets shipped per day from this DC — green is historical actuals "
                 "(by actual ship date), blue is the forward plan (by scheduled ship date). "
@@ -2887,7 +2899,7 @@ def render_detail(dc_id, df_summary):
                 )
                 fig_carrier.update_layout(height=400, showlegend=True,
                                           legend=dict(orientation="h", y=-0.1))
-                st.plotly_chart(fig_carrier, use_container_width=True)
+                st.plotly_chart(fig_carrier, width="stretch")
                 st.caption(
                     "Share of outbound pallets by courier across history and the forward plan."
                 )
@@ -2905,7 +2917,7 @@ def render_detail(dc_id, df_summary):
             disp["Pallets"] = disp["Pallets"].round(1)
             if max_ob_pallets > 0:
                 disp["Capacity %"] = (100.0 * disp["Pallets"] / max_ob_pallets).round(1)
-            st.dataframe(disp, use_container_width=True, hide_index=True)
+            st.dataframe(disp, width="stretch", hide_index=True)
 
     # --- Sidebar: Scenario Parameters ---
     st.sidebar.header("⚙️ Scenario Parameters")
@@ -3006,7 +3018,7 @@ def render_detail(dc_id, df_summary):
     RESULTS_KEY = f"results::{dc_id}"
     COMP_KEY = f"comp_results::{dc_id}"
 
-    if st.sidebar.button("\U0001f680 Run Optimization", type="primary", use_container_width=True):
+    if st.sidebar.button("\U0001f680 Run Optimization", type="primary", width="stretch"):
         with st.spinner(f"Solving optimization model for {dc_id}..."):
             results = run_optimization(
                 df_products, df_demand, df_inventory, df_capacity,
@@ -3076,7 +3088,7 @@ def render_detail(dc_id, df_summary):
                     f"${comp['total_labor_cost'] - results['total_labor_cost']:+,.0f}",
                 ],
             })
-            st.dataframe(comp_df, use_container_width=True, hide_index=True)
+            st.dataframe(comp_df, width="stretch", hide_index=True)
 
         fill_tab_label = (
             "\U0001f4e6 Fill Rate by Category" if selected_category is None
@@ -3128,7 +3140,7 @@ def render_detail(dc_id, df_summary):
                           annotation_text="Capacity limit")
             fig.update_layout(title="Capacity Utilization by Period (5 constraints)",
                               yaxis_title="Utilization %", barmode="group", height=420)
-            st.plotly_chart(fig, use_container_width=True)
+            st.plotly_chart(fig, width="stretch")
             st.caption(
                 "Each bar shows how much of that constraint's daily capacity the "
                 "optimizer's plan consumes. Anything over 100% becomes overflow "
@@ -3174,7 +3186,7 @@ def render_detail(dc_id, df_summary):
                 title="Outbound Pallets per Day (LP Solution)",
                 xaxis_title="Period", yaxis_title="Pallets", height=400,
             )
-            st.plotly_chart(fig_ob, use_container_width=True)
+            st.plotly_chart(fig_ob, width="stretch")
             st.caption(
                 "LP-allocated outbound pallets per period. "
                 "Bars above the dashed dock capacity line are absorbed as outbound overflow penalty."
@@ -3198,7 +3210,7 @@ def render_detail(dc_id, df_summary):
             fig_tp.update_layout(
                 xaxis_title="Period", yaxis_title="Units", height=350,
             )
-            st.plotly_chart(fig_tp, use_container_width=True)
+            st.plotly_chart(fig_tp, width="stretch")
 
         with tab3:
             penalty_breakdown = pd.DataFrame({
@@ -3216,7 +3228,7 @@ def render_detail(dc_id, df_summary):
                 color_discrete_sequence=px.colors.qualitative.Set2,
             )
             fig2.update_layout(height=400)
-            st.plotly_chart(fig2, use_container_width=True)
+            st.plotly_chart(fig2, width="stretch")
             st.caption(
                 "Penalty $ from each soft-constraint slack, stacked by constraint type. "
                 "Each unit of slack costs its configured penalty in `config.yaml` "
@@ -3236,7 +3248,7 @@ def render_detail(dc_id, df_summary):
                 "Outbound overflow (pallets)": df_ov["outbound_overflow"],
                 "Inbound overflow (pallets)":  df_ov["inbound_overflow"],
             })
-            st.dataframe(overflow_qty, use_container_width=True, hide_index=True)
+            st.dataframe(overflow_qty, width="stretch", hide_index=True)
 
         with tab4:
             # First aggregate to per-SKU totals from the LP solution, then
@@ -3268,7 +3280,7 @@ def render_detail(dc_id, df_summary):
             )
             fig3.add_hline(y=95, line_dash="dash", annotation_text="95% Target")
             fig3.update_layout(height=400, yaxis_title="Fill Rate %")
-            st.plotly_chart(fig3, use_container_width=True)
+            st.plotly_chart(fig3, width="stretch")
             st.caption(
                 "Fill rate = Σ fulfilled / Σ demand from the LP solution, "
                 "rolled up demand-weighted to category (or per SKU when drilled in). "
@@ -3283,7 +3295,7 @@ def render_detail(dc_id, df_summary):
                                   name="Overtime Hours", marker_color="#FFA15A"))
             fig4.update_layout(title="Labor Hours Allocation",
                                barmode="stack", yaxis_title="Hours", height=400)
-            st.plotly_chart(fig4, use_container_width=True)
+            st.plotly_chart(fig4, width="stretch")
             st.caption(
                 "LP-allocated regular hours (green) and overtime hours (orange) per period. "
                 "Overtime kicks in only after regular hours are fully consumed."
@@ -3305,7 +3317,7 @@ def render_detail(dc_id, df_summary):
                 title="Total Inventory Trajectory (Optimized Plan)",
                 xaxis_title="Period", yaxis_title="Units", height=350,
             )
-            st.plotly_chart(fig_inv_traj, use_container_width=True)
+            st.plotly_chart(fig_inv_traj, width="stretch")
             st.caption(
                 "Total ending inventory across all SKUs per period in the LP solution. "
                 "Inventory balance: prior + inbound − fulfilled."
@@ -3335,7 +3347,7 @@ def render_detail(dc_id, df_summary):
                 aspect="auto",
             )
             fig_heat.update_layout(height=400)
-            st.plotly_chart(fig_heat, use_container_width=True)
+            st.plotly_chart(fig_heat, width="stretch")
             st.caption(
                 "Per-category (or per-SKU when drilled in) ending inventory units "
                 "across the planning horizon. Darker red = higher inventory."
@@ -3372,7 +3384,7 @@ def render_detail(dc_id, df_summary):
                 legend=dict(orientation="h", yanchor="bottom",
                             y=1.02, xanchor="right", x=1),
             )
-            st.plotly_chart(fig_compare, use_container_width=True)
+            st.plotly_chart(fig_compare, width="stretch")
     else:
         st.info(
             f"\U0001f448 Adjust parameters in the sidebar and click **Run Optimization** "
@@ -3396,7 +3408,7 @@ if _on_detail:
         render_ask_ai()
     with _back_col:
         st.write("")
-        if st.button("← Back to map", use_container_width=True, key="top_back"):
+        if st.button("← Back to map", width="stretch", key="top_back"):
             st.session_state["view"] = "map"
             st.session_state["selected_dc"] = None
             st.rerun()
