@@ -174,13 +174,21 @@ def inject_css():
     .info-card-table tr:last-child td { border-bottom: none; }
 
     /* Streamlit widget overrides */
-    .stButton > button[kind="primary"] {
+    .stButton > button[kind="primary"],
+    .stButton > button[kind="primary"] p,
+    .stButton > button[kind="primary"] span,
+    .stButton > button[kind="primary"] * {
         background-color: var(--dark-blue) !important;
         border-color: var(--dark-blue) !important;
+        color: #FFFFFF !important;
     }
-    .stButton > button[kind="primary"]:hover {
+    .stButton > button[kind="primary"]:hover,
+    .stButton > button[kind="primary"]:hover p,
+    .stButton > button[kind="primary"]:hover span,
+    .stButton > button[kind="primary"]:hover * {
         background-color: #1D4ED8 !important;
         border-color: #1D4ED8 !important;
+        color: #FFFFFF !important;
     }
     [data-testid="stMetricValue"] { color: #1E293B !important; font-weight: 700; }
     .stSuccess { border-left-color: var(--primary-green) !important; }

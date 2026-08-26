@@ -1,0 +1,12 @@
+command: 
+  - "streamlit" 
+  - "run"
+  - "app.py"
+
+env:
+  - name: DATABRICKS_WAREHOUSE_ID
+    description: "SQL Warehouse ID for executing queries (find in SQL Warehouses > Connection Details)"
+    value: "976bafd641e9ac60"
+  - name: GENIE_SPACE_ID
+    description: "Genie Agent ID for executing chat sessions"
+    value: "01f15b67757317bb8c3897487e777c45"

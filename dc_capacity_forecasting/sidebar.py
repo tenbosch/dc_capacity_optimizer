@@ -6,6 +6,7 @@ import streamlit as st
 from connection import run_query
 from queries import QUERY_FILTER_OPTIONS
 from utils import MONTH_ABBR
+from genie_chat import render_chat_dialog
 
 
 def render_sidebar():
@@ -109,6 +110,11 @@ def render_sidebar():
         # outlier_sensitivity = st.select_slider(
         #     "Outlier Sensitivity", options=[1.0, 1.5, 2.0, 2.5, 3.0], value=1.5
         # )
+
+        # --- AI Chat Assistant ---
+        st.markdown("---")
+        if st.button("\U0001F4AC AI Assistant", key="genie_chat_open", type="primary", use_container_width=True):
+            render_chat_dialog()
 
         # --- Sidebar Footer ---
         st.markdown("---")

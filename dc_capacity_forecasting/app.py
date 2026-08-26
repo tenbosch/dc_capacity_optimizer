@@ -75,3 +75,4 @@ with tab6:
 # Tab 5 (Forecasting & ML) is hidden — code kept intact but not executed.
 if False:
     forecasting_ml.render(df_core)
+

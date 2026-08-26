@@ -4,6 +4,7 @@ import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
 
+
 from connection import run_query
 from queries import (QUERY_BILLING, QUERY_VOLUME_DATA)
 from utils import (apply_filters, chart_layout, empty_state, info_card)
@@ -331,6 +332,8 @@ def render(df_core):
                         st.info("No volume data available for the top 20 WMAPE SKUs.")
                 except Exception as e:
                     st.warning(f"Could not load volume data for top SKUs: {e}")
+
+
 
         else:
             empty_state("No billing data available for current filters.")
